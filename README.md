@@ -142,3 +142,7 @@ python3 -m unittest discover -s tests -v
 | `AC_MAX_FILE_MB` | 50 | 게시될 이력의 blob 크기 상한(MB). 초과하면 push 보류 |
 
 전체 변수와 검증 조건은 [bin/autocommit](bin/autocommit) 머리말을 참고하세요.
+
+## 라이선스
+
+[MIT](LICENSE)
