@@ -1034,6 +1034,7 @@ unblock() { # unblock <저장소> [<브랜치>]: 브랜치를 주면 그 브랜�
 }
 
 tick() {
+  [ -r "$CONF" ] || { echo "autocommit: 설정 파일이 없다: $CONF — ./install.sh --init-config로 예제를 만든 뒤 저장소를 적는다" >&2; return 1; }
   NOW=$(date +%s); rotate_log
   local line path cglobs remote pglobs extra root wts common seen="" nf
   while IFS= read -r line; do
