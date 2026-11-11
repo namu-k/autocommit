@@ -1,0 +1,4 @@
+# `autocommit scan`에서 의도적으로 제외할 저장소 경로를 한 줄에 하나씩 둡니다.
+# 이 파일은 탐지 결과를 숨길 뿐 repos.conf에 자동 등록하지 않습니다.
+#
+# ~/workspace/vendor/example

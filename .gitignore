@@ -1,0 +1,10 @@
+# Local validation and editor files
+.DS_Store
+*.swp
+*.tmp
+__pycache__/
+*.pyc
+
+# Never put live user state or configuration in this repository.
+state/
+config/
