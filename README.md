@@ -1,8 +1,68 @@
+<div align="center">
+
 # autocommit
+
+**허용한 저장소만, 안정된 변경만, 검증을 통과한 커밋과 push만.**
+
+Conservative auto-commit loop for herdr that delegates commits to coding CLIs
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platform: Linux](https://img.shields.io/badge/platform-Linux-informational)
+![Bash 4.4+](https://img.shields.io/badge/bash-4.4%2B-4EAA25?logo=gnubash&logoColor=white)
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white)
+![Agents: claude · opencode · agy · codex](https://img.shields.io/badge/agents-claude%20%C2%B7%20opencode%20%C2%B7%20agy%20%C2%B7%20codex-8A2BE2)
+
+[설치](#설치와-설정) · [명령](#명령) · [CLI 선택](#커밋-위임-cli-선택-autocommit-agent) · [환경 변수](#환경-변수) · [FAQ](#자주-묻는-질문) · [English](#english-summary)
+
+</div>
+
+---
 
 `autocommit`은 herdr 안에서 실행되는 보수적인 Git 자동 관리 루프입니다. 허용 목록에 있는 저장소만 살피고, 변경이 충분히 안정된 뒤 지정한 코딩 CLI(claude·opencode·agy·codex)에게 원자적인 커밋 단위를 만들도록 요청합니다. push는 별도 검증을 통과한 경우에만 시도합니다.
 
 아래 문서에서 **hoc**는 커밋을 맡는 실행기(`AC_HOC`, 기본 `bin/autocommit-agent`)를 가리킵니다. 로그·audit 출력에도 같은 이름으로 나옵니다.
+
+## 목차
+
+- [주요 특징](#주요-특징)
+- [작동 방식](#작동-방식)
+- [설치와 설정](#설치와-설정)
+- [명령](#명령)
+- [커밋 위임 CLI 선택](#커밋-위임-cli-선택-autocommit-agent)
+- [마커 정리와 주간 점검](#마커-정리와-주간-점검)
+- [능동적 관리 정책](#능동적-관리-정책)
+- [요구 사항](#요구-사항) · [테스트](#테스트) · [환경 변수](#환경-변수)
+- [자주 묻는 질문](#자주-묻는-질문)
+- [English summary](#english-summary)
+
+## 주요 특징
+
+| 특징 | 내용 |
+| --- | --- |
+| **허용 목록 기반** | `repos.conf`에 사람이 적은 저장소만 관리합니다. `scan`이 찾은 새 저장소는 알리기만 하고 자동 등록하지 않습니다. |
+| **안정화 뒤 커밋** | 워크트리 지문이 `AC_SETTLE`(기본 600초) 동안 유지돼야 커밋을 맡기고, 에이전트가 작업 중인 워크트리는 보류합니다. |
+| **도구 없는 커밋 제안** | claude·opencode·agy는 셸·파일 도구 없이 커밋 제안 JSON만 만들고, 로컬 실행기가 검증한 뒤 정확한 파일 목록으로 커밋합니다. |
+| **보수적인 push** | `AC_REMOTE_ALLOW`에 맞는 원격, 새로 게시될 모든 커밋의 위험 파일·대용량 blob 검사, SHA 안정화를 통과해야 push합니다. |
+| **실패는 보류로** | 조회 실패·검증 실패·중단은 성공으로 보지 않고 보류합니다. 남은 기록은 `audit`·`review`가 보고하고 사람이 `unblock`으로 풉니다. |
+| **적응형 주기** | 깨끗한 저장소는 확인 간격을 최대 1일까지 늘리고, 파일 수정이 생기면 다음 tick에서 바로 빠른 주기로 돌아옵니다. |
+
+## 작동 방식
+
+```mermaid
+flowchart LR
+    A["repos.conf 허용 목록"] --> B["변경 감지<br/>ref · 워크트리 · git status"]
+    B --> C{"AC_SETTLE 동안<br/>안정 · 비점유?"}
+    C -- 아니요 --> B
+    C -- 예 --> D["hoc<br/>CLI가 커밋 제안 JSON 생성"]
+    D --> E{"실행기 검증<br/>경로 · 중복 · HEAD · index"}
+    E -- 실패 --> F["커밋하지 않고<br/>실패 기록"]
+    E -- 통과 --> G["정확한 파일 목록으로<br/>새 커밋"]
+    G --> H{"push 검사<br/>원격 허용 · 위험 파일 · SHA 안정화"}
+    H -- 보류 --> I["보류 상태 유지<br/>audit · review가 보고"]
+    H -- 통과 --> J["git push"]
+```
+
+claude·opencode·agy 경로 기준의 단순화한 흐름입니다. `codex` 경로는 제한 없이 직접 커밋하며, 세부 조건은 아래 각 절에 있습니다.
 
 ## 설치와 설정
 
@@ -71,6 +131,9 @@ claude·opencode·agy는 로컬 실행기가 수집한 변경 자료로 커밋 �
 
 비밀 경로, 심볼릭 링크, binary, 32KB 초과 미추적 파일과 입력 예산을 넘는 변경은 모델 자료와 커밋 후보에서 제외합니다. 추적 파일은 전체 원문 대신 staged·unstaged diff를 보내며 변경 자료 예산은 48KB입니다. 루트 AGENTS.md·CLAUDE.md는 각각 4KB 이하일 때 자료에 넣습니다. 자료만으로 완료·검증 여부를 판단하지 못하면 커밋하지 않아야 하며, 모델 판단이 검증 사실 자체를 증명하지는 않습니다. 부분적으로 stage한 파일은 후보에서 제외하고, 후보가 없으면 모델 호출도 생략합니다. 파일 일부의 변경만 나누는 커밋은 지원하지 않습니다. 이 경우 직접 커밋합니다. 코드·변경 자료는 선택한 CLI의 모델 제공자에게 전송되므로 전송 가능한 저장소만 등록합니다.
 
+> [!WARNING]
+> 코드·변경 자료는 선택한 CLI의 모델 제공자에게 전송됩니다. 전송해도 되는 저장소만 `repos.conf`에 등록하세요. `codex` 경로는 에이전트의 push까지 기술적으로 막지 못합니다.
+
 CLI 실패나 잘못된 JSON은 커밋하지 않고 실패로 기록합니다. `once`는 커밋 실행 실패 시 비영점으로 끝납니다. 커밋 뒤 HEAD·브랜치·직선 이력 검증과 push 판정은 autocommit이 수행합니다. CLI 업데이트 뒤에는 실제 환경에서 다시 확인합니다.
 
 ## 마커 정리와 주간 점검
@@ -87,7 +150,12 @@ audit의 `[상기]`(`AC_AUDIT_REMIND`) 문구는 `참고`로 표시하고 해결
 
 주간 review는 선택 사항입니다. 설정을 마친 뒤 `./install.sh --enable-review-timer`를 실행하면 unit을 설치하고 timer를 활성화합니다. 기본 설치는 unit·서비스를 변경하지 않습니다. timer를 끄려면 `systemctl --user disable --now autocommit-review.timer`를 실행합니다.
 
+<details>
+<summary><b>주간 review 동작·보고서·메일 설정 상세</b></summary>
+
 `autocommit-review.timer`는 매주 월요일 09:00에 `review`를 실행합니다. review는 loop의 잠금이 비어 있을 때만 정리하고, 그 뒤 audit 출력과 남은 마커 전체(작동 중인 `nochg`는 `git status`와 `.gitignore` 포함)를 `codex exec` 읽기 전용 sandbox에 넘깁니다. codex가 없으면 분류 없이 원본 점검 출력만 보고서로 남깁니다. 보고서는 `~/.local/state/autocommit/review-<시각>.md`, 입력은 `.input`, 로그는 `.log`에 남습니다. 항목으로 세는 것은 push 보류, push 금지 마커, `AC_STALE_MARKER_DAYS`(기본 3일) 이상 된 작동 중 `nochg`·매핑 불명 마커입니다. 그보다 새 마커와 스스로 풀리는 `fail`은 참고로만 싣고, 항목이 0건이면 에이전트와 메일을 생략합니다. 메일은 `AC_REVIEW_MAIL_CMD`(인자 = 제목, 표준 입력 = 본문)로 보내며 기본은 메일 없음입니다. unit에 지정하려면 `systemctl --user edit autocommit-review.service`에서 `[Service]` 아래 `Environment=AC_REVIEW_MAIL_CMD=<명령>`을 추가합니다. codex가 `~/.local/bin`·`/usr/local/bin`·`/usr/bin` 밖(nvm 등)에 있으면 같은 방법으로 `Environment=PATH=...`를 덮어씁니다. timer의 review는 loop의 환경 변수를 물려받지 않으므로 `Environment=AC_REMOTE_ALLOW=<loop와 같은 정규식>`도 넣습니다. 없으면 원격 확인이 모두 실패해 `nopush` 마커를 풀지 못합니다(안전한 쪽으로 남음). 메일 발송이 실패하면 unit이 실패로 끝납니다.
+
+</details>
 
 ### hoc 실행 기록과 수동 복구
 
@@ -107,17 +175,32 @@ loop가 hoc 도중 중단됐거나, hoc 뒤 HEAD·브랜치·직선성 조회가
 
 기본 루프는 작업 중인 저장소를 빠르게 확인합니다. 깨끗한 상태가 계속되면 다음 전체 확인 주기를 `AC_IDLE_MAX_INTERVAL`(기본 86400초, 1일)까지 늘려 커밋·push 판정과 원격 조회를 줄입니다. 매 기본 tick마다 브랜치 ref, 워크트리 목록, 각 워크트리의 `git status`를 가볍게 비교하므로 HEAD 변경뿐 아니라 파일 수정도 다음 tick에서 바로 깨워 빠른 주기로 되돌아옵니다. 이 비교는 `git --no-optional-locks`로 실행해 작업 중인 에이전트와 Git 잠금을 다투지 않습니다. `once`와 `plan`은 이 대기 정책을 우회합니다.
 
+<details>
+<summary><b>새 저장소 탐지</b></summary>
+
 새 저장소 탐지는 `AC_SCAN_INTERVAL`(기본 86400초, 1일)마다 실행됩니다. 발견해도 사람이 `repos.conf`에 추가해야 하므로 늦게 알아도 잃는 것이 없습니다. 발견 개수와 첫 저장소 경로를 herdr 알림 창에 표시하고 요청 알림음을 지정합니다. 전체 목록은 `~/.local/state/autocommit/autocommit.log`와 `autocommit scan`으로 확인합니다. herdr 호출이 실패하면 로그에 경고를 남깁니다. 실제 화면 표시와 소리는 herdr 및 운영체제 알림 설정에 따릅니다. 발견 내용은 `repos.conf`에는 쓰지 않습니다. `AC_SCAN_IGNORE`에 둔 경로는 이미 검토해 제외한 대상이므로 탐지에서 빼며, 이 파일도 자동으로 수정하지 않습니다.
+
+</details>
+
+<details>
+<summary><b>오래 지속된 미커밋 변경의 현황파악(checkpoint)</b></summary>
 
 오래 지속되는 dirty 워크트리(커밋하지 않은 변경이 있는 작업 폴더)는 같은 HEAD에서 처음 관측된 뒤 `AC_CHECKPOINT_AFTER`(기본 10800초, 3시간)가 지나면 현황 조사를 실행합니다. 기본은 **탭을 만들지 않는 백그라운드 실행**입니다. `codex exec`를 `AC_CHECKPOINT_MODEL`(기본: codex 기본 모델)·`AC_CHECKPOINT_EFFORT`(기본 `high`)와 읽기 전용 sandbox·승인 요청 없음으로 실행합니다. 조사 중에는 별도 잠금으로 해당 워크트리의 자동 커밋을 보류합니다. 변경을 완료·검증된 커밋 후보, 작업 중인 변경, 커밋하면 안 될 파일로 나눠 보고할 뿐 파일 수정·stage·커밋은 하지 않습니다. 보고서는 `~/.local/state/autocommit/ckpt-<작업폴더와 HEAD 해시>.md`, 실행 로그는 같은 이름의 `.log`, 종료 코드는 `.rc`로 보존하며 완료·실패 시 Herdr 알림으로 경로를 안내합니다. 실행은 최대 30분으로 제한합니다. codex가 없으면 조사 대신 알림만 남깁니다. 같은 HEAD에서는 한 번만 조사하고, 깨끗해지거나 커밋되면 시간을 다시 셉니다. `AC_CHECKPOINT_AFTER=0`이면 조사를 끕니다. 이전 대화형 탭 방식은 `AC_CHECKPOINT_TRANSPORT=tab`으로 선택할 수 있습니다. 기존 조사 탭은 자동으로 닫지 않습니다. 에이전트가 `working`, `blocked`, `unknown` 상태인 워크트리는 계속 보류합니다. hoc에는 완료·검증된 원자적 변경 단위를 요청하고, 실행기는 hoc의 종료 상태와 전후 HEAD·브랜치·직선 이력을 검증합니다.
 
 현재 작업 중인 부분과 이전 완료 작업이 같은 워크트리에 섞이면 파일 수정 시간만으로 안전하게 분리할 수 없습니다. 작업을 수행하는 에이전트가 완료한 변경 단위와 검증 결과를 확인해 그 부분을 직접 커밋하는 방식을 권장합니다. autocommit은 활성 에이전트의 변경 범위를 알 수 없으므로 해당 워크트리의 보류를 해제하지 않습니다. 3시간은 현황파악 기준이며, 미완성 변경을 강제 커밋하는 기한이 아닙니다. 소환된 에이전트가 `working`인 동안에는 같은 워크트리의 hoc 호출도 보류됩니다.
+
+</details>
+
+<details>
+<summary><b>push 보류 조건과 위험 파일 검사</b></summary>
 
 자동 push도 해당 브랜치 워크트리의 에이전트가 작업 중이거나 점유 조회가 실패하면 보류합니다. 추적 파일에 staged/unstaged 변경이 있거나 Git 작업이 진행 중이어도 보류하며, 기존 미추적 파일만 남은 경우는 push를 영구 차단하지 않습니다. 단, commit 브랜치가 `-`이고 push 브랜치를 별도로 지정한 저장소(예: `~/notes - origin main`)는 미커밋 변경을 그대로 두고 캡처한 커밋 SHA만 push합니다. 이 경우도 에이전트 점유·Git 작업·상태 조회·SHA 안정화·위험 파일 검사는 유지합니다. 브랜치 SHA를 처음 관측한 뒤 `AC_SETTLE` 동안 유지돼야 push합니다. amend/reset으로 SHA가 바뀌거나 작업 중 상태가 관측되면 안정화 시간을 다시 셉니다. loop 시작 직후에는 `AC_FIRST_SETTLE`을 적용합니다. 미전송 커밋이 있는 저장소는 검사 간격을 기본 주기로 유지합니다. push 직전에 점유·Git 상태와 브랜치 SHA를 다시 확인합니다. `plan`은 안정화 상태를 기록하지 않습니다.
 
 위험 파일 검사는 원격 추적 ref부터 캡처한 SHA까지 새로 게시될 모든 커밋을 봅니다(merge는 부모마다 비교, 이름 변경은 삭제+추가로 취급). 중간 커밋에서 추가했다 지우거나 줄인 금지 경로·`AC_MAX_FILE_MB`(기본 50MB) 초과 blob도 보류하며, 이력·객체 조회나 해석이 실패해도 보류합니다. 원격은 push URL이 정확히 하나이고 fetch URL과 같으며 `AC_REMOTE_ALLOW`에 맞을 때만 push하고, 서브모듈 원격으로의 재귀 push는 끕니다. 에이전트 점유는 워크트리 루트와 그 하위 경로(가장 긴 워크트리 우선)로 판정하며, 작업 중인데 위치를 알 수 없는 에이전트가 있거나 응답 해석이 실패하면 commit·push 모두 보류합니다.
 
 사람이 기존 커밋의 즉시 전송을 명시하는 `push-only`는 안정화 대기만 생략하며, 점유·미커밋 변경·원격·위험 파일·SHA 재확인은 동일하게 적용합니다. hoc에는 기존 이력을 고치지 않고 새 커밋만 만들도록 요청합니다. 이미 push된 커밋을 외부 세션에서 amend/reset하면 다시 분기할 수 있으므로, 공개된 커밋의 수정은 새 커밋으로 남깁니다.
+
+</details>
 
 ## 요구 사항
 
@@ -156,6 +239,54 @@ python3 -m unittest discover -s tests -v
 | `AC_MAX_FILE_MB` | 50 | 게시될 이력의 blob 크기 상한(MB). 초과하면 push 보류 |
 
 전체 변수와 검증 조건은 [bin/autocommit](bin/autocommit) 머리말을 참고하세요.
+
+## 자주 묻는 질문
+
+### autocommit은 무엇을 자동화하나요?
+
+허용 목록(`repos.conf`)에 있는 Git 저장소의 변경이 안정되면, 지정한 코딩 CLI(claude·opencode·agy·codex)에게 원자적인 커밋 단위를 만들도록 맡기고, 별도 검증을 통과한 브랜치만 push합니다.
+
+### 자동으로 push까지 하나요?
+
+`AC_REMOTE_ALLOW`에 맞는 원격에만 push합니다. 비워 두면 어떤 원격에도 push하지 않고, `AC_PUSH=0`이면 push 단계 전체를 끕니다. `repos.conf`에서 push 원격을 `-`로 두면 그 저장소의 push만 끕니다.
+
+### 내 코드가 외부로 전송되나요?
+
+네. 커밋 제안을 만들기 위해 변경 자료가 선택한 CLI의 모델 제공자에게 전송됩니다. 비밀 경로·심볼릭 링크·binary·32KB 초과 미추적 파일은 자료에서 제외하지만, 전송 가능한 저장소만 등록해야 합니다.
+
+### herdr 없이 사용할 수 있나요?
+
+`up`·`loop`·`once`는 herdr 환경에서만 실행됩니다. `plan`·`scan`·`audit`는 읽기 전용 확인에 쓸 수 있습니다. `HERDR_ENV`를 직접 설정해 실제 herdr 연결을 대체할 수는 없습니다.
+
+### 3시간이 지나면 미완성 변경을 강제로 커밋하나요?
+
+아니요. `AC_CHECKPOINT_AFTER`(기본 3시간)는 현황파악 기준이며, 미완성 변경을 강제 커밋하는 기한이 아닙니다. 현황파악 에이전트는 읽기 전용으로 보고만 하고 파일 수정·stage·커밋은 하지 않습니다.
+
+### 새로 만든 저장소도 자동으로 관리되나요?
+
+아니요. `scan`이 허용 목록 밖 저장소를 찾아 알리기만 하고, `repos.conf`에는 쓰지 않습니다. 검토한 뒤 사람이 직접 추가합니다.
+
+### 파일 일부의 변경만 골라 커밋할 수 있나요?
+
+지원하지 않습니다. 부분적으로 stage한 파일은 후보에서 제외되므로 이 경우 직접 커밋합니다.
+
+### macOS나 Windows에서 동작하나요?
+
+지원 환경은 Linux입니다. Bash 4.4 이상과 GNU coreutils·grep·findutils, util-linux(`flock`)가 필요합니다.
+
+## English summary
+
+**autocommit** is a conservative Git auto-commit loop for Linux that runs inside [herdr](https://herdr.dev/tui/docs/install/). It watches only the repositories you allow-list in `~/.config/autocommit/repos.conf`, waits until changes have settled, and asks a coding CLI (`claude`, `opencode`, `agy`, or `codex`) to create atomic commits. With `claude`, `opencode`, and `agy`, the model gets no shell or file tools: it only returns a commit-proposal JSON, which a local executor validates before committing the exact file list. Pushes happen only to remotes matching `AC_REMOTE_ALLOW`, after every commit to be published passes risky-path and large-blob checks and the branch SHA stays stable. Anything that cannot be verified is held, not assumed safe, and reported by `autocommit audit` / `autocommit review`.
+
+```bash
+git clone https://github.com/namu-k/autocommit.git && cd autocommit
+./install.sh --init-config
+export AC_AGENT=claude AC_PUSH=0   # start without pushing
+autocommit plan                    # dry run: show decisions only
+autocommit up                      # start the loop inside herdr
+```
+
+Note: changed code is sent to the model provider of the CLI you choose.
 
 ## 라이선스
 
