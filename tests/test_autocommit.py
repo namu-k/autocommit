@@ -57,7 +57,7 @@ class AutocommitTests(unittest.TestCase):
             '  "agent list") echo \'{"result":{"agents":[]}}\' ;;\n'
             '  "tab list") echo \'{"result":{"tabs":[]}}\' ;;\n'
             '  *) exit 1 ;;\nesac\n')
-        for tool in ("hoc", "codex", "ccg-call", "gh", "notify-mail"):
+        for tool in ("hoc", "codex", "gh"):
             (guard / tool).write_text("#!/bin/sh\n" + record + "echo \"guard: $(basename \"$0\") must not run in tests\" >&2\nexit 97\n")
         for f in guard.iterdir():
             f.chmod(0o755)
@@ -314,21 +314,20 @@ class AutocommitTests(unittest.TestCase):
         self.assertIn("report", output)
         self.assertTrue(output.rstrip().endswith("0"))
 
-    def test_background_checkpoint_usage_limit_fallback_has_no_panes(self):
+    def test_background_checkpoint_usage_limit_reports_failure_without_panes(self):
         r = shlex.quote(str(self.repo))
         output = self.shell(
             'CHECKPOINT_TRANSPORT=background; load_agents() { AGENTS_JSON="[]"; }; '
-            'herdr() { echo unexpected >> "$STATE/tabs"; }; note() { :; }; '
+            'herdr() { echo unexpected >> "$STATE/tabs"; }; note() { echo "NOTE $*" >> "$STATE/notes"; }; '
             'codex() { echo "hit your usage limit"; return 1; }; '
-            'ccg-call() { cat > "$STATE/evidence"; echo fallback-report; }; '
             'timeout() { shift; "$@"; }; '
             f'h=$(git -C {r} rev-parse HEAD); checkpoint_dispatch {r} main "$h" 3 {r}; wait; '
             'test ! -f "$STATE/tabs" || exit 1; '
-            'cat "$STATE"/ckpt-*.md; cat "$STATE"/ckpt-*.rc; cat "$STATE/evidence"')
-        self.assertIn("fallback-report", output)
-        self.assertIn("## git status", output)
+            'cat "$STATE"/ckpt-*.rc; cat "$STATE/notes"')
+        self.assertIn("현황 조사 실패", output)
+        self.assertTrue(output.startswith("1"))
 
-    def test_checkpoint_retries_with_ccg_after_codex_usage_limit(self):
+    def test_checkpoint_notes_codex_usage_limit_once(self):
         r = shlex.quote(str(self.repo))
         (self.repo / "a").write_text("changed")
         output = self.shell(
@@ -336,7 +335,7 @@ class AutocommitTests(unittest.TestCase):
             '"agent get") printf \'{"result":{"agent":{"agent_status":"%s"}}}\' "$(cat "$STATE/st")" ;; '
             '"agent read") cat "$STATE/screen" ;; '
             '"pane split") echo \'{"result":{"pane":{"pane_id":"wX:p10"}}}\' ;; esac; }; '
-            'ccg-call() { :; }; sleep() { :; }; note() { echo "NOTE $*"; }; CHECKPOINT_AFTER=10; '
+            'sleep() { :; }; note() { echo "NOTE $*"; }; CHECKPOINT_AFTER=10; '
             f'h=$(git -C {r} rev-parse HEAD); mark="$STATE/ckpt-$(hash {r})"; '
             f'NOW=1000; checkpoint_notice {r} main {r}; echo "$h codex ckpt-x wX:t9 wX:p9" > "$mark"; '
             'echo working > "$STATE/st"; NOW=1010; '
@@ -344,13 +343,10 @@ class AutocommitTests(unittest.TestCase):
             'echo done > "$STATE/st"; echo "■ You\'ve hit your usage limit. Visit ..." > "$STATE/screen"; '
             f'NOW=1020; checkpoint_notice {r} main {r}; read -r _ s2 _ < "$mark"; '
             f'NOW=1030; checkpoint_notice {r} main {r}; '
-            'echo "s1=$s1 s2=$s2"; cat "$STATE/calls"; cat "$STATE"/ckpt-*-ccg.txt')
-        self.assertIn("s1=codex s2=ccg", output)
-        self.assertEqual(output.count("pane split wX:p9 --direction down"), 1)
-        self.assertIn("ccg-call --profile text <", output)
-        self.assertIn("## git diff (최대 60000바이트)", output)
-        self.assertIn("+changed", output)
-        self.assertNotIn("NOTE", output)
+            'echo "s1=$s1 s2=$s2"; cat "$STATE/calls"')
+        self.assertIn("s1=codex s2=note", output)
+        self.assertNotIn("pane split", output)
+        self.assertEqual(output.count("codex 한도 초과로 현황 조사 실패"), 1)
 
     def test_checkpoint_followup_marks_done_without_usage_limit(self):
         r = shlex.quote(str(self.repo))

@@ -28,7 +28,6 @@
 #       AC_CHECKPOINT_AFTER(초, 10800; 0=끔): 장시간 미커밋 변경이면 백그라운드에서 에이전트에게 현황파악을 맡긴다.
 #         HEAD당 한 번. 자동 커밋은 계속 보류하고, 소환이 실패하면 알림으로 대신한다
 #       AC_CHECKPOINT_KIND(codex) AC_CHECKPOINT_MODEL(비면 codex 기본 모델) AC_CHECKPOINT_EFFORT(high): 현황파악 에이전트 (읽기 전용 sandbox)
-#         codex가 한도 오류(hit your usage limit)로 끝나면 git 출력을 모아 도구 없는 ccg-call --profile text로 한 번 재시도한다
 #       AC_NOTE_LONG(초, 86400; 이 시간 넘게 이어진 알림과 정적 사실(upstream 없음 등)은 하루 한 번으로 늦춘다)
 set -uo pipefail
 umask 077
@@ -293,10 +292,6 @@ checkpoint_background() { # 실행은 터미널 없이, 보고서와 종료 코�
       -c "model_reasoning_effort=$CHECKPOINT_EFFORT" -c approval_policy=never \
       -s read-only --color never -o "$base.md" "$prompt" > "$base.log" 2>&1
     rc=$?
-    if [ "$rc" != 0 ] && grep -q 'hit your usage limit' "$base.log"; then
-      checkpoint_ccg "$wt" "$br" "$head" "$hours" "" "" > "$base.md" 2>> "$base.log"
-      rc=$?
-    fi
     echo "$rc" > "$base.rc"
     exec {ckfd}>&-
     if [ "$rc" = 0 ] && [ -s "$base.md" ]; then
@@ -309,7 +304,7 @@ checkpoint_background() { # 실행은 터미널 없이, 보고서와 종료 코�
   log "CKPT  $wt [$br] 미커밋 ${hours}시간 → background (${CHECKPOINT_MODEL:-default}/$CHECKPOINT_EFFORT) 보고서 $base.md"
 }
 checkpoint_followup() { # <wt> <branch> <head> <hours> <name> <tab> <pane>: 소환한 codex가 끝나면 한 번 확인한다.
-  # codex 한도 오류로 끝났으면 ccg-call로 한 번 재시도한다. 작업 중이면 다음 tick에 다시 본다
+  # codex 한도 오류로 끝났으면 사람에게 알린다. 작업 중이면 다음 tick에 다시 본다
   local wt=$1 br=$2 head=$3 hours=$4 name=$5 tab=$6 pane=$7 mark="$STATE/ckpt-$(hash "$1")" st out
   st=$(herdr agent get "$name" 2>/dev/null | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
   case "$st" in working|blocked|unknown) return 0 ;; esac
@@ -322,39 +317,9 @@ checkpoint_followup() { # <wt> <branch> <head> <hours> <name> <tab> <pane>: 소�
   if ! grep -q 'hit your usage limit' <<< "$out"; then
     echo "$head done $name $tab $pane" > "$mark"; return 0
   fi
-  if checkpoint_ccg "$wt" "$br" "$head" "$hours" "$tab" "$pane"; then
-    echo "$head ccg $name $tab $pane" > "$mark"; return 0
-  fi
   echo "$head note $name $tab $pane" > "$mark"
-  note "checkpoint:$wt:$head" "중간 커밋 점검: $wt [$br] 미커밋 변경 ${hours}시간 — codex 한도 초과, ccg 재시도도 실패(로그 $LOG). 완료·검증된 논리 단위를 커밋하고 작업 중 변경은 남겨 주세요"
+  note "checkpoint:$wt:$head" "중간 커밋 점검: $wt [$br] 미커밋 변경 ${hours}시간 — codex 한도 초과로 현황 조사 실패(로그 $LOG). 완료·검증된 논리 단위를 커밋하고 작업 중 변경은 남겨 주세요"
 }
-checkpoint_ccg() { # <wt> <branch> <head> <hours> <tab> <pane>: git 출력을 모아 도구 없는 ccg-call(text)에 넘긴다.
-  # text 프로필은 도구가 없어 워크트리를 건드릴 수 없다. 결과는 codex 탭 아래 새 pane에 출력된다
-  local wt=$1 br=$2 head=$3 hours=$4 tab=$5 pane=$6 ev out np g
-  command -v ccg-call >/dev/null || { log "WARN  ccg-call 없음 — checkpoint ccg 재시도 생략"; return 1; }
-  g=(git --no-optional-locks -C "$wt")
-  ev="$STATE/ckpt-$(hash "$wt")-ccg.txt"
-  { checkpoint_prompt "$wt" "$br" "$head" "$hours" ""
-    printf '\n도구는 없습니다. 아래 git 출력만 근거로 판단하고, 근거가 부족한 부분은 부족하다고 쓰세요.\n'
-    echo "## git status"; "${g[@]}" status --porcelain=v1 -b -uall
-    echo "## git diff --cached --stat"; "${g[@]}" diff --cached --stat
-    echo "## git diff --stat"; "${g[@]}" diff --stat
-    echo "## git log -8"; "${g[@]}" log -8 --oneline
-    echo "## git diff --cached (최대 30000바이트)"; "${g[@]}" diff --cached | head -c 30000
-    echo "## git diff (최대 60000바이트)"; "${g[@]}" diff | head -c 60000
-  } > "$ev" 2>&1
-  if [ -z "$pane" ]; then
-    timeout 1800 ccg-call --profile text < "$ev"
-    return $?
-  fi
-  out=$(herdr pane split "$pane" --direction down --cwd "$wt" --no-focus 2>&1) \
-    || out=$(herdr tab create ${HERDR_WORKSPACE_ID:+--workspace "$HERDR_WORKSPACE_ID"} --cwd "$wt" --label "ckpt-ccg" --no-focus 2>&1) \
-    || { log "WARN  checkpoint ccg pane 생성 실패: $out"; return 1; }
-  np=$(jq -r '.result.pane.pane_id // .result.root_pane.pane_id' <<< "$out"); sleep 1
-  herdr pane run "$np" "ccg-call --profile text < $(printf %q "$ev")" >/dev/null 2>&1 || { log "WARN  checkpoint ccg 실행 실패($np)"; return 1; }
-  log "CKPT  $wt [$br] codex 한도 초과 → ccg-call 재시도 ($tab $np)"
-}
-
 # ---- herdr 에이전트 점유 판정 (조회 실패 = fail-closed) ----
 AGENTS_JSON=""; AGENTS_OK=0
 load_agents() { # 응답 형식은 여기서 검증한다. 절대 경로가 아닌 cwd는 null(위치 불명)로 둔다 — 빈 문자열로 바꾸면 "점유 없음"이 된다
@@ -965,11 +930,6 @@ review() { # 매주 timer가 부른다. 정리는 잠금이 비었을 때만, �
     head -c 60000 "$base.input" | timeout 1800 codex exec -C "$HOME" --skip-git-repo-check ${CHECKPOINT_MODEL:+-m "$CHECKPOINT_MODEL"} \
       -c "model_reasoning_effort=$CHECKPOINT_EFFORT" -c approval_policy=never \
       -s read-only --color never -o "$base.md" "$(review_prompt)" > "$base.log" 2>&1
-    rc=$?
-  fi
-  if [ "$rc" != 0 ] && { [ "$rc" = 127 ] || grep -q 'hit your usage limit' "$base.log" 2>/dev/null; } && command -v ccg-call >/dev/null; then
-    { review_prompt; printf '\n도구는 없습니다. 아래 출력만 근거로 판단하고, 근거가 부족한 부분은 부족하다고 쓰세요.\n'; head -c 60000 "$base.input"; } \
-      | timeout 1800 ccg-call --profile text > "$base.md" 2>> "$base.log"
     rc=$?
   fi
   if [ "$rc" = 0 ] && [ -s "$base.md" ]; then
