@@ -786,7 +786,7 @@ audit() {
     root=$(expand "$path"); disp=${root/#$HOME/\~}
     [ -d "$root" ] || { echo "- 경로 없음: $disp — repos.conf에서 지우거나 경로를 고친다"; continue; }
     git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "- git 저장소 아님: $disp"; continue; }
-    # 공개 저장소 회귀 — push가 켜진 행의 원격이 PUBLIC이면 이 세션에서 세운 원칙이 깨진 것
+    # 공개 저장소 회귀 — 작업 중 커밋이 공개 원격으로 자동 게시되지 않도록 push가 켜진 PUBLIC 원격을 경고한다 (gh가 있을 때만)
     if [ "$remote" != - ]; then
       vis=$(gh_visibility "$(git -C "$root" remote get-url "$remote" 2>/dev/null)")
       [ "$vis" = PUBLIC ] && echo "- 공개 저장소인데 자동 push가 켜져 있다: $disp ($remote) — repos.conf 3열을 '-'로"
