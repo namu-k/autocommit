@@ -1,0 +1,1098 @@
+#!/usr/bin/env bash
+# autocommit — herdr 상주 pane에서 도는 주기 커밋·push 루프.
+#
+#   autocommit up            현재 herdr workspace에 'autocommit' 탭을 만들고 그 안에서 loop 실행 (환경변수 그대로 전달)
+#   autocommit loop          전면에서 무한 루프 (herdr pane 안에서 실행)
+#   autocommit once          한 바퀴만 돌고 종료
+#   autocommit plan          판정만 출력. 상태 파일·로그를 쓰지 않는다 (herdr 밖에서도 됨; ls-remote만 네트워크 사용)
+#   autocommit push-only     commit 단계 없이 push 단계만 (첫 가동 때 기존 ahead 브랜치를 사람이 승인해 내보내는 용도)
+#   autocommit unblock <저장소> [<브랜치>]   loop 중지 후. 브랜치: hoc 검증 실패로 걸린 push 금지 마커 해제 / 생략: 미해결 hoc 실행 기록 해제
+#   autocommit scan          설정(repos.conf)에 없는 git 저장소를 찾아 출력. 읽기 전용 — 설정을 고치지 않는다
+#   autocommit audit         스스로 풀리지 않는 상태(영구 보류·낡은 마커·공개 저장소 회귀 등)를 점검해 출력. 읽기 전용
+#   autocommit tidy          효과가 없다고 증명되는 마커(만료된 fail, 무효 nochg, 내보낼 것 없는 nopush)만 지운다. loop가 돌면 건너뛴다
+#   autocommit review        tidy 뒤 남은 항목을 읽기 전용 에이전트가 분류해 보고서로 남기고 AC_REVIEW_MAIL_CMD로 메일 보낸다
+#
+# 설계: 목록 갱신 = 브랜치 + 워크트리 / commit = 워크트리 단위(hoc -c, 메시지는 LLM) / push = 브랜치 단위, 판정 시 캡처한 SHA 고정
+# 설정: ~/.config/autocommit/repos.conf   (형식은 그 파일 머리말 참고)
+# 환경: AC_INTERVAL(초, 900) AC_SETTLE(초, 600) AC_FIRST_SETTLE(시작 후 이 시간 동안은 settle을 이 값으로, 3600) AC_PUSH(1; 0이면 push 단계 전체 생략)
+#       AC_FAIL_COOLDOWN(초, 3600) AC_REMOTE_TIMEOUT(조회, 초, 60) AC_PUSH_TIMEOUT(전송, 초, 900) AC_MAX_FILE_MB(50) AC_REMOTE_ALLOW(push 허용 원격 URL 정규식, 필수 — 비면 push 안 함) AC_FORBID(금지 경로 정규식)
+#       AC_AGENT(claude|opencode|agy|codex: 커밋을 맡길 CLI) AC_AGENT_MODEL(선택)
+#       AC_HOC(커밋 실행기, 기본 같은 폴더의 autocommit-agent; hoc 호환 인터페이스 '<명령> -c <지시>'). commit·push 모두 working/blocked/unknown = 점유, idle/done = 비점유
+#       AC_SCAN_ROOTS(탐지 시작 경로, 기본 ~/workspace ~) AC_SCAN_DEPTH(4) AC_SCAN_INTERVAL(초, 86400; 0이면 loop 중 자동 탐지 끔)
+#       AC_SCAN_IGNORE(사람이 이미 판단해 제외한 경로 목록, 기본 ~/.config/autocommit/scan-ignore)
+#       AC_AUDIT_INTERVAL(초, 86400; 0이면 loop 중 자동 점검 끔) AC_AUDIT_REMIND(매 점검마다 그대로 출력할 상기 문구 파일)
+#       AC_REVIEW_MAIL_CMD(review 보고서 전송 명령: 인자 = 제목, 표준 입력 = 본문; 없으면 메일 생략) — 에이전트는 AC_CHECKPOINT_MODEL/EFFORT를 쓴다
+#       AC_LOG_KEEP(구조화 로그 보관 세대수, 5) AC_HLOG_MAX(hoc 원문 로그 최대 바이트, 20000000)
+#       구조화 로그는 각 hoc 호출의 run ID·CCG result.json 보존 경로·결과/권한 거부 요약을 함께 남긴다.
+#       AC_IDLE_MAX_INTERVAL(초, 86400): loop에서 깨끗한 저장소 검사 간격 상한 (파일 수정은 매 tick git status로 바로 깨운다)
+#       AC_CHECKPOINT_AFTER(초, 10800; 0=끔): 장시간 미커밋 변경이면 백그라운드에서 에이전트에게 현황파악을 맡긴다.
+#         HEAD당 한 번. 자동 커밋은 계속 보류하고, 소환이 실패하면 알림으로 대신한다
+#       AC_CHECKPOINT_KIND(codex) AC_CHECKPOINT_MODEL(비면 codex 기본 모델) AC_CHECKPOINT_EFFORT(high): 현황파악 에이전트 (읽기 전용 sandbox)
+#         codex가 한도 오류(hit your usage limit)로 끝나면 git 출력을 모아 도구 없는 ccg-call --profile text로 한 번 재시도한다
+#       AC_NOTE_LONG(초, 86400; 이 시간 넘게 이어진 알림과 정적 사실(upstream 없음 등)은 하루 한 번으로 늦춘다)
+set -uo pipefail
+umask 077
+
+CONF=${AC_CONF:-$HOME/.config/autocommit/repos.conf}
+STATE=${AC_STATE:-$HOME/.local/state/autocommit}
+LOG=$STATE/autocommit.log
+LOG_MAX=${AC_LOG_MAX:-5000000}
+LOG_KEEP=${AC_LOG_KEEP:-5}
+HLOG=$STATE/hoc.log                    # hoc(opencode) 원문 출력 — 대부분의 바이트를 차지하므로 구조화 로그와 분리해 따로 회전시킨다
+HLOG_MAX=${AC_HLOG_MAX:-20000000}
+INTERVAL=${AC_INTERVAL:-900}
+SETTLE=${AC_SETTLE:-600}               # 커밋은 워크트리 지문, push는 브랜치 SHA가 이 시간 동안 안정돼야 한다
+FIRST_SETTLE=${AC_FIRST_SETTLE:-3600}  # 시작 후 이 시간 동안은 settle을 이 값으로 — 시작 직전까지 손대던 워크트리를 바로 집지 않도록 (첫 커밋은 빨라야 시작+이 값)
+PUSH=${AC_PUSH:-1}
+FAIL_COOLDOWN=${AC_FAIL_COOLDOWN:-3600}
+NOTE_LONG=${AC_NOTE_LONG:-86400}       # 하루 넘게 이어지는 알림·정적 사실은 하루 한 번으로 늦춘다 (알림 피로 방지)
+REMOTE_TIMEOUT=${AC_REMOTE_TIMEOUT:-60}
+PUSH_TIMEOUT=${AC_PUSH_TIMEOUT:-900}
+MAX_FILE_MB=${AC_MAX_FILE_MB:-50}
+REMOTE_ALLOW=${AC_REMOTE_ALLOW:-}           # 비어 있으면 어떤 원격에도 push하지 않는다
+FORBID=${AC_FORBID:-'(^|/)\.env(\..*)?$|\.(pem|key|p12|pfx)$|(^|/)id_(rsa|ed25519|ecdsa)(\.pub)?$|(^|/)\.netrc$|(^|/)credentials(\.json)?$|(^|/)\.aws/'}
+
+HOC=${AC_HOC:-$(dirname -- "$(readlink -f -- "$0")")/autocommit-agent}   # install.sh가 심볼릭 링크로 설치하므로 실제 위치 기준
+SCAN_ROOTS=${AC_SCAN_ROOTS:-"$HOME/workspace $HOME"}
+SCAN_DEPTH=${AC_SCAN_DEPTH:-4}
+SCAN_INTERVAL=${AC_SCAN_INTERVAL:-86400}
+SCAN_IGNORE=${AC_SCAN_IGNORE:-$HOME/.config/autocommit/scan-ignore}
+AUDIT_INTERVAL=${AC_AUDIT_INTERVAL:-86400}
+AUDIT_REMIND=${AC_AUDIT_REMIND:-$HOME/.config/autocommit/audit-remind}
+STALE_MARKER_DAYS=${AC_STALE_MARKER_DAYS:-3}
+IDLE_MAX_INTERVAL=${AC_IDLE_MAX_INTERVAL:-86400}
+CHECKPOINT_AFTER=${AC_CHECKPOINT_AFTER:-10800}
+CHECKPOINT_TRANSPORT=${AC_CHECKPOINT_TRANSPORT:-background}
+case "$CHECKPOINT_TRANSPORT" in background|tab) ;; *) echo "autocommit: AC_CHECKPOINT_TRANSPORT는 background 또는 tab이어야 한다" >&2; exit 2 ;; esac
+CHECKPOINT_KIND=${AC_CHECKPOINT_KIND:-codex}
+CHECKPOINT_MODEL=${AC_CHECKPOINT_MODEL:-}
+CHECKPOINT_EFFORT=${AC_CHECKPOINT_EFFORT:-high}
+REVIEW_MAIL_CMD=${AC_REVIEW_MAIL_CMD:-}
+for value in "$INTERVAL" "$IDLE_MAX_INTERVAL" "$CHECKPOINT_AFTER" "$SCAN_INTERVAL"; do
+  case "$value" in ''|*[!0-9]*) echo "autocommit: 검사/알림 간격은 0 이상의 정수여야 한다" >&2; exit 2 ;; esac
+done
+INTERVAL=$((10#$INTERVAL))
+IDLE_MAX_INTERVAL=$((10#$IDLE_MAX_INTERVAL))
+CHECKPOINT_AFTER=$((10#$CHECKPOINT_AFTER))
+SCAN_INTERVAL=$((10#$SCAN_INTERVAL))
+[ "$INTERVAL" -gt 0 ] || { echo "autocommit: AC_INTERVAL은 양수여야 한다" >&2; exit 2; }
+[ "$IDLE_MAX_INTERVAL" -ge "$INTERVAL" ] || IDLE_MAX_INTERVAL=$INTERVAL
+MODE=${1:-once}
+DRY=0; case "$MODE" in plan|scan|audit) DRY=1 ;; esac
+NOW=$(date +%s)
+if [ "$DRY" = 0 ]; then mkdir -p "$STATE"; chmod 700 "$STATE"; chmod 600 "$STATE"/* 2>/dev/null || true; fi
+
+hash()  { printf %s "$1" | md5sum | cut -c1-16; }
+log()   { local l; l="$(date '+%F %T') $*"; if [ "$DRY" = 1 ]; then echo "$l" >&2; else echo "$l" | tee -a "$LOG" >&2; fi; }
+valid_time() { # 상태 파일의 시각만 허용: 빈 값·산술식·8진수·overflow·미래 시각은 손상으로 취급
+  [[ "$1" =~ ^(0|[1-9][0-9]{0,17})$ ]] && [ "$1" -le "$NOW" ]
+}
+write_state() { # 같은 디렉터리에서 완전히 쓴 뒤 교체한다. ENOSPC여도 기존 기록은 보존
+  local f=$1 tmp
+  if tmp=$(mktemp "${f%/*}/.state.XXXXXXXX") &&
+     printf '%s\n' "$2" > "$tmp" && mv -f -- "$tmp" "$f"; then
+    return 0
+  fi
+  [ -z "$tmp" ] || rm -f -- "$tmp"
+  printf 'autocommit: 상태 기록 실패: %s\n' "$f" >&2
+  return 1
+}
+once_at() { # once_at <초> <key> <msg…>: 같은 키는 그 시간 동안 한 번만 로그. plan은 항상 출력, 상태 안 씀
+  local iv=$1 key=$2; shift 2; local f="$STATE/once-$(hash "$key")" last=""
+  if [ "$DRY" = 1 ]; then log "$@"; return; fi
+  [ ! -f "$f" ] || last=$(cat "$f")
+  valid_time "$last" && [ $((NOW - last)) -lt "$iv" ] && return
+  write_state "$f" "$NOW"; log "$@"
+}
+once()  { once_at "$FAIL_COOLDOWN" "$@"; }   # once <key> <msg…>: 기본 주기
+brief() { # brief <여러 줄>: "첫 줄 외 N건". 목록 전체를 한 줄에 붙이면 로그도 토스트도 못 읽는다
+  local n; n=$(grep -c . <<< "$1")
+  [ "$n" -le 1 ] && { printf '%s' "$1"; return; }
+  printf '%s 외 %d건' "$(head -1 <<< "$1")" "$((n-1))"
+}
+note()  { # note <key> <msg…>: once + herdr 토스트
+  local key=$1; shift; local f="$STATE/note-$(hash "$key")" last="" first cd
+  if [ "$DRY" = 1 ]; then log "NOTE $*"; return; fi
+  # 사람이 손대야만 풀리는 상태는 며칠 이어진다. 매시간 토스트를 띄우면 곧 읽히지 않으므로
+  # 하루를 넘긴 알림은 주기를 하루로 늦춘다. 첫 발생의 즉시성은 그대로 둔다. 파일 = "마지막 시각 최초 시각"
+  first=$NOW
+  if [ -f "$f" ]; then
+    read -r last first < "$f"
+  fi
+  if valid_time "$last"; then
+    valid_time "$first" && [ "$first" -le "$last" ] || first=$last
+    cd=$FAIL_COOLDOWN; [ $((NOW - first)) -ge "$NOTE_LONG" ] && cd=$NOTE_LONG
+    [ $((NOW - last)) -lt "$cd" ] && return
+    [ $((NOW - last)) -gt $((cd * 2)) ] && first=$NOW   # 주기의 2배 넘게 조용했다 = 굳은 상태가 아니라 새 발생
+  else
+    first=$NOW
+  fi
+  write_state "$f" "$NOW $first"; log "NOTE $*"
+  if command -v herdr >/dev/null; then
+    herdr notification show "autocommit" --body "$*" --sound request >/dev/null 2>&1 || log "WARN  herdr 알림 전달 실패 — 알림 내용은 $LOG에서 확인"
+  else
+    log "WARN  herdr 없음 — 알림 내용은 $LOG에서 확인"
+  fi
+}
+expand() { printf '%s' "${1/#\~/$HOME}"; }
+glob_match() { local pats=$1 name=$2 p; [ "$pats" = - ] && return 1; IFS=, read -ra arr <<< "$pats"; for p in "${arr[@]}"; do case "$name" in $p) return 0 ;; esac; done; return 1; }
+rotate_one() { # rotate_one <파일> <최대바이트> <보관 세대수>: 초과하면 .1 .2 … 로 밀어내고 가장 오래된 것을 버린다
+  local f=$1 max=$2 keep=$3 i
+  [ -f "$f" ] || return 0
+  [ "$(stat -c %s "$f" 2>/dev/null || echo 0)" -gt "$max" ] || return 0
+  for ((i=keep-1; i>=1; i--)); do [ -f "$f.$i" ] && mv -f "$f.$i" "$f.$((i+1))"; done
+  mv -f "$f" "$f.1"
+}
+rotate_log() { [ "$DRY" = 1 ] && return 0; rotate_one "$LOG" "$LOG_MAX" "$LOG_KEEP"; rotate_one "$HLOG" "$HLOG_MAX" 2; true; }
+
+# ---- git 상태 판정 (gitwatch의 is_merging을 확장) ----
+in_progress() { # merge/rebase/cherry-pick/revert/bisect 진행 중 또는 index.lock이면 이름 출력
+  local gd; gd=$(git -C "$1" rev-parse --git-dir 2>/dev/null) || return 0
+  [ "${gd#/}" = "$gd" ] && gd="$1/$gd"
+  local f; for f in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do [ -e "$gd/$f" ] && { echo "$f"; return; }; done
+  [ -d "$gd/rebase-merge" ] || [ -d "$gd/rebase-apply" ] && { echo rebase; return; }
+  [ -e "$gd/index.lock" ] && { echo index.lock; return; }
+  return 0
+}
+worktrees_of() { git -C "$1" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p'; }
+worktree_of_branch() { git -C "$1" worktree list --porcelain 2>/dev/null | awk -v b="refs/heads/$2" '/^worktree /{w=substr($0,10)} $0=="branch "b{print w}'; }
+fingerprint() { # 워크트리 상태 지문: 상태 목록 + 추적 파일 diff + 미추적 파일 이름·크기·mtime
+  { git --no-optional-locks -C "$1" status --porcelain -uall -z 2>/dev/null   # 관측만 한다 — 작업 중인 에이전트와 index 잠금을 다투지 않는다
+    git --no-optional-locks -C "$1" diff HEAD --no-color --no-ext-diff 2>/dev/null
+    git --no-optional-locks -C "$1" ls-files -o --exclude-standard -z 2>/dev/null | (cd "$1" && xargs -0 -r stat -c '%n %s %Y' 2>/dev/null)
+  } | sha1sum | cut -c1-40
+}
+AGE=
+FP=
+settled() { # 지문이 SETTLE 동안 안 바뀌었으면 0. AGE에 경과 초, AGE='?'는 plan에서 기록 없음
+  local wt=$1 fp f prev="" first=""
+  fp=$(fingerprint "$wt"); f="$STATE/fp-$(hash "$wt")"
+  [ -f "$f" ] && read -r prev first < "$f"
+  if [ "$prev" != "$fp" ] || ! valid_time "$first"; then
+    [ "$DRY" = 1 ] && { AGE='?'; return 1; }
+    first=$NOW
+    write_state "$f" "$fp $first" || { AGE='?'; return 1; }
+  fi
+  FP=$fp; AGE=$((NOW - first)); [ "$AGE" -ge "$SETTLE" ]
+}
+
+# ---- 조용한 저장소의 검사 간격 / 오래된 미커밋 변경 ----
+repo_signature() { # ref·워크트리 목록에 각 워크트리의 status를 더한다. 깨끗하던 저장소의 파일 수정도 다음 tick에 깨운다
+  local wtl wt
+  wtl=$(git -C "$1" worktree list --porcelain)
+  { git -C "$1" for-each-ref --format='%(refname) %(objectname)' refs/heads refs/remotes
+    printf '%s\n' "$wtl"
+    while IFS= read -r wt; do   # 에이전트가 편집 중일 수 있으므로 index.lock을 잡지 않는다
+      [ -d "$wt" ] && git --no-optional-locks -C "$wt" status --porcelain -uall 2>/dev/null
+    done < <(sed -n 's/^worktree //p' <<< "$wtl")
+  } | sha1sum | cut -c1-40
+}
+repo_due() {
+  local root=$1 policy=$2 f last delay old
+  [ "$MODE" = loop ] || return 0
+  f="$STATE/poll-$(hash "$root")"
+  POLL_SIGNATURE=$(repo_signature "$root"):$policy
+  [ -f "$f" ] || return 0
+  read -r last delay old < "$f" || return 0
+  valid_time "$last" && [[ "$delay" =~ ^[1-9][0-9]{0,17}$ ]] &&
+    [ "$delay" -ge "$INTERVAL" ] && [ "$delay" -le "$IDLE_MAX_INTERVAL" ] || return 0
+  [ "$old" = "$POLL_SIGNATURE" ] || return 0
+  [ $((NOW - last)) -ge "$delay" ]
+}
+repo_schedule() {
+  local root=$1 wts=$2 wt status quiet=1 f last delay=$INTERVAL old
+  [ "$MODE" = loop ] || return 0
+  [ "${PUSH_PENDING:-0}" = 1 ] && quiet=0
+  while IFS= read -r wt; do
+    [ -d "$wt" ] || { quiet=0; break; }
+    status=$(git --no-optional-locks -C "$wt" status --porcelain -uall 2>/dev/null) || { quiet=0; break; }
+    [ -z "$status" ] && [ -z "$(in_progress "$wt")" ] || { quiet=0; break; }
+  done <<< "$wts"
+  f="$STATE/poll-$(hash "$root")"
+  if [ "$quiet" = 1 ] && [ -f "$f" ]; then
+    read -r last delay old < "$f"
+    if valid_time "$last" && [[ "$delay" =~ ^[1-9][0-9]{0,17}$ ]] &&
+       [ "$delay" -ge "$INTERVAL" ] && [ "$delay" -le "$IDLE_MAX_INTERVAL" ] &&
+       [ "$old" = "$POLL_SIGNATURE" ]; then delay=$((delay * 2)); else delay=$INTERVAL; fi
+  fi
+  [ "$quiet" = 1 ] || delay=$INTERVAL
+  [ "$delay" -le "$IDLE_MAX_INTERVAL" ] || delay=$IDLE_MAX_INTERVAL
+  write_state "$f" "$NOW $delay $POLL_SIGNATURE"
+}
+checkpoint_notice() { # checkpoint_notice <wt> <branch> <이 저장소의 워크트리 목록>
+  local wt=$1 br=$2 f head previous first mark hours mhead mstate mname mtab mpane
+  [ "$CHECKPOINT_AFTER" -gt 0 ] || return 0
+  f="$STATE/dirty-$(hash "$wt")"
+  head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || head=unborn
+  previous=; first=$NOW
+  [ ! -f "$f" ] || read -r previous first < "$f"
+  if [ "$previous" != "$head" ] || ! valid_time "$first"; then
+    first=$NOW
+    if [ "$DRY" != 1 ]; then write_state "$f" "$head $first" || return 1; fi
+  fi
+  [ $((NOW - first)) -ge "$CHECKPOINT_AFTER" ] || return 0
+  hours=$(((NOW - first) / 3600)); mark="$STATE/ckpt-$(hash "$wt")"
+  if [ -f "$mark" ]; then   # 파일 = "HEAD 상태 에이전트이름 탭 pane". 이 HEAD에서는 이미 맡겼다. 매 tick 탭을 새로 만들지 않는다
+    read -r mhead mstate mname mtab mpane < "$mark"
+    if [ "$mhead" = "$head" ]; then
+      [ "$mstate" = codex ] && [ "$DRY" != 1 ] && checkpoint_followup "$wt" "$br" "$head" "$hours" "$mname" "$mtab" "$mpane"
+      return 0
+    fi
+  fi
+  if [ "$DRY" = 1 ]; then log "PLAN  checkpoint $wt [$br] ${hours}시간 → ${CHECKPOINT_MODEL:-codex 기본 모델} 현황파악 ($CHECKPOINT_TRANSPORT)"; return 0; fi
+  echo "$head note" > "$mark"
+  checkpoint_dispatch "$wt" "$br" "$head" "$hours" "${3:-$wt}" && return 0
+  note "checkpoint:$wt:$head" "중간 커밋 점검: $wt [$br] 미커밋 변경 ${hours}시간 — 현황파악 에이전트 소환 실패(로그 $LOG). 완료·검증된 논리 단위를 커밋하고 작업 중 변경은 남겨 주세요"
+}
+checkpoint_prompt() { # <wt> <branch> <head> <hours> <busy>
+  printf '%s' "[autocommit checkpoint] 이 워크트리($1, 브랜치 $2, HEAD ${3:0:10})에 같은 HEAD에서 ${4}시간째 미커밋 변경이 있습니다. 점유 에이전트: ${5:-없음}. 현황파악만 하고 보고하세요. 파일 수정·stage·commit·stash·checkout·reset은 하지 마세요(다른 에이전트가 작업 중일 수 있습니다). git status·git diff·git log로 변경을 (1) 완료·검증된 논리 단위(커밋 후보, Conventional Commits 메시지 제안, 검증 근거) (2) 작업 중인 변경 (3) 커밋하면 안 될 파일로 나누고, 다음에 누가 무엇을 해야 하는지 짧게 정리하세요."
+}
+checkpoint_dispatch() { # <wt> <branch> <head> <hours> <wts>: 그 워크트리 에이전트의 workspace에 탭을 만들고 현황파악만 맡긴다.
+  # 커밋은 맡기지 않는다. 작업 중인 에이전트와 같은 워크트리이므로 읽기 전용 sandbox로 띄운다.
+  # 소환된 에이전트가 working인 동안은 busy_agent_in이 hoc 호출도 막는다
+  local wt=$1 br=$2 head=$3 hours=$4 wts=$5 ws busy name out tab pane prompt
+  if [ "$CHECKPOINT_TRANSPORT" = background ]; then
+    checkpoint_background "$wt" "$br" "$head" "$hours" "$wts"; return $?
+  fi
+  command -v herdr >/dev/null || { log "WARN  herdr 없음 — checkpoint 현황파악 생략"; return 1; }
+  load_agents || { log "WARN  herdr agent list 실패 — checkpoint 현황파악 생략"; return 1; }
+  busy=$(busy_agent_in "$wt" "$wts") || busy="판정 실패"
+  ws=$(agent_workspace_in "$wt" "$wts") || { log "WARN  checkpoint workspace 판정 실패 — 현황파악 생략"; return 1; }
+  ws=${ws:-${HERDR_WORKSPACE_ID:-}}   # 일치하는 에이전트가 없을 때만 현재 workspace
+  name="ckpt-$(hash "$wt:$head" | cut -c1-12)"
+  out=$(herdr tab create ${ws:+--workspace "$ws"} --cwd "$wt" --label "$name" --no-focus 2>&1) || { log "WARN  checkpoint 탭 생성 실패: $out"; return 1; }
+  tab=$(jq -r '.result.tab.tab_id' <<< "$out"); pane=$(jq -r '.result.root_pane.pane_id' <<< "$out")
+  if ! out=$(herdr agent start "$name" --kind "$CHECKPOINT_KIND" --pane "$pane" --timeout 60000 -- \
+               ${CHECKPOINT_MODEL:+-m "$CHECKPOINT_MODEL"} -c "model_reasoning_effort=$CHECKPOINT_EFFORT" -s read-only -a never 2>&1); then
+    log "WARN  checkpoint 에이전트 시작 실패($tab): $out"; herdr tab close "$tab" >/dev/null 2>&1; return 1
+  fi
+  prompt=$(checkpoint_prompt "$wt" "$br" "$head" "$hours" "$busy")
+  # 시작 직후 첫 입력은 TUI가 아직 받지 못해 유실될 수 있다. working 전환으로 전달을 확인하고 한 번 더 보낸다
+  out=$(herdr agent prompt "$name" "$prompt" --wait --until working --timeout 15000 2>&1) \
+    || { sleep 5; out=$(herdr agent prompt "$name" "$prompt" --wait --until working --timeout 15000 2>&1); } \
+    || { log "WARN  checkpoint 요청 전달 실패($tab $name): $out"; return 1; }
+  echo "$head codex $name $tab $pane" > "$STATE/ckpt-$(hash "$wt")"
+  log "CKPT  $wt [$br] 미커밋 ${hours}시간 → $tab $name (${CHECKPOINT_MODEL:-default}/$CHECKPOINT_EFFORT) 현황파악 요청"
+}
+checkpoint_background() { # 실행은 터미널 없이, 보고서와 종료 코드는 HEAD별 파일에 보존한다.
+  local wt=$1 br=$2 head=$3 hours=$4 wts=$5 base prompt busy ckfd
+  command -v codex >/dev/null || { log "WARN  codex 없음 — checkpoint 현황파악 생략"; return 1; }
+  load_agents || { log "WARN  herdr agent list 실패 — checkpoint 현황파악 생략"; return 1; }
+  busy=$(busy_agent_in "$wt" "$wts") || busy="판정 실패"
+  prompt=$(checkpoint_prompt "$wt" "$br" "$head" "$hours" "$busy")
+  base="$STATE/ckpt-$(hash "$wt:$head")"
+  # 부모 loop의 잠금은 물려받지 않는다. 별도 잠금은 조사 중 hoc와 중복 조사를 막는다.
+  exec {ckfd}>"$STATE/ckpt-lock-$(hash "$wt")"
+  flock -n "$ckfd" || { exec {ckfd}>&-; return 1; }
+  echo "$head background - - -" > "$STATE/ckpt-$(hash "$wt")"
+  (
+    trap '' HUP
+    exec 9>&-
+    local rc
+    timeout 1800 codex exec -C "$wt" ${CHECKPOINT_MODEL:+-m "$CHECKPOINT_MODEL"} \
+      -c "model_reasoning_effort=$CHECKPOINT_EFFORT" -c approval_policy=never \
+      -s read-only --color never -o "$base.md" "$prompt" > "$base.log" 2>&1
+    rc=$?
+    if [ "$rc" != 0 ] && grep -q 'hit your usage limit' "$base.log"; then
+      checkpoint_ccg "$wt" "$br" "$head" "$hours" "" "" > "$base.md" 2>> "$base.log"
+      rc=$?
+    fi
+    echo "$rc" > "$base.rc"
+    exec {ckfd}>&-
+    if [ "$rc" = 0 ] && [ -s "$base.md" ]; then
+      note "checkpoint-result:$wt:$head" "현황 조사 완료: $wt [$br] — 보고서 $base.md"
+    else
+      note "checkpoint-result:$wt:$head" "현황 조사 실패: $wt [$br] — 종료 코드 $rc, 로그 $base.log"
+    fi
+  ) </dev/null >/dev/null 2>&1 &
+  exec {ckfd}>&-
+  log "CKPT  $wt [$br] 미커밋 ${hours}시간 → background (${CHECKPOINT_MODEL:-default}/$CHECKPOINT_EFFORT) 보고서 $base.md"
+}
+checkpoint_followup() { # <wt> <branch> <head> <hours> <name> <tab> <pane>: 소환한 codex가 끝나면 한 번 확인한다.
+  # codex 한도 오류로 끝났으면 ccg-call로 한 번 재시도한다. 작업 중이면 다음 tick에 다시 본다
+  local wt=$1 br=$2 head=$3 hours=$4 name=$5 tab=$6 pane=$7 mark="$STATE/ckpt-$(hash "$1")" st out
+  st=$(herdr agent get "$name" 2>/dev/null | jq -r '.result.agent.agent_status // empty' 2>/dev/null)
+  case "$st" in working|blocked|unknown) return 0 ;; esac
+  if [ -n "$st" ]; then
+    out=$(herdr agent read "$name" --source recent-unwrapped --lines 200 2>/dev/null) || return 0
+  elif ! out=$(herdr pane read "$pane" --source recent-unwrapped --lines 200 2>&1); then
+    grep -q pane_not_found <<< "$out" && echo "$head gone $name $tab $pane" > "$mark"   # 사람이 탭을 닫았다
+    return 0
+  fi
+  if ! grep -q 'hit your usage limit' <<< "$out"; then
+    echo "$head done $name $tab $pane" > "$mark"; return 0
+  fi
+  if checkpoint_ccg "$wt" "$br" "$head" "$hours" "$tab" "$pane"; then
+    echo "$head ccg $name $tab $pane" > "$mark"; return 0
+  fi
+  echo "$head note $name $tab $pane" > "$mark"
+  note "checkpoint:$wt:$head" "중간 커밋 점검: $wt [$br] 미커밋 변경 ${hours}시간 — codex 한도 초과, ccg 재시도도 실패(로그 $LOG). 완료·검증된 논리 단위를 커밋하고 작업 중 변경은 남겨 주세요"
+}
+checkpoint_ccg() { # <wt> <branch> <head> <hours> <tab> <pane>: git 출력을 모아 도구 없는 ccg-call(text)에 넘긴다.
+  # text 프로필은 도구가 없어 워크트리를 건드릴 수 없다. 결과는 codex 탭 아래 새 pane에 출력된다
+  local wt=$1 br=$2 head=$3 hours=$4 tab=$5 pane=$6 ev out np g
+  command -v ccg-call >/dev/null || { log "WARN  ccg-call 없음 — checkpoint ccg 재시도 생략"; return 1; }
+  g=(git --no-optional-locks -C "$wt")
+  ev="$STATE/ckpt-$(hash "$wt")-ccg.txt"
+  { checkpoint_prompt "$wt" "$br" "$head" "$hours" ""
+    printf '\n도구는 없습니다. 아래 git 출력만 근거로 판단하고, 근거가 부족한 부분은 부족하다고 쓰세요.\n'
+    echo "## git status"; "${g[@]}" status --porcelain=v1 -b -uall
+    echo "## git diff --cached --stat"; "${g[@]}" diff --cached --stat
+    echo "## git diff --stat"; "${g[@]}" diff --stat
+    echo "## git log -8"; "${g[@]}" log -8 --oneline
+    echo "## git diff --cached (최대 30000바이트)"; "${g[@]}" diff --cached | head -c 30000
+    echo "## git diff (최대 60000바이트)"; "${g[@]}" diff | head -c 60000
+  } > "$ev" 2>&1
+  if [ -z "$pane" ]; then
+    timeout 1800 ccg-call --profile text < "$ev"
+    return $?
+  fi
+  out=$(herdr pane split "$pane" --direction down --cwd "$wt" --no-focus 2>&1) \
+    || out=$(herdr tab create ${HERDR_WORKSPACE_ID:+--workspace "$HERDR_WORKSPACE_ID"} --cwd "$wt" --label "ckpt-ccg" --no-focus 2>&1) \
+    || { log "WARN  checkpoint ccg pane 생성 실패: $out"; return 1; }
+  np=$(jq -r '.result.pane.pane_id // .result.root_pane.pane_id' <<< "$out"); sleep 1
+  herdr pane run "$np" "ccg-call --profile text < $(printf %q "$ev")" >/dev/null 2>&1 || { log "WARN  checkpoint ccg 실행 실패($np)"; return 1; }
+  log "CKPT  $wt [$br] codex 한도 초과 → ccg-call 재시도 ($tab $np)"
+}
+
+# ---- herdr 에이전트 점유 판정 (조회 실패 = fail-closed) ----
+AGENTS_JSON=""; AGENTS_OK=0
+load_agents() { # 응답 형식은 여기서 검증한다. 절대 경로가 아닌 cwd는 null(위치 불명)로 둔다 — 빈 문자열로 바꾸면 "점유 없음"이 된다
+  AGENTS_OK=0
+  AGENTS_JSON=$(herdr agent list 2>/dev/null | jq -ce '
+    def loc: if type == "string" and startswith("/") then (if . == "/" then . else sub("/+$"; "") end) else null end;
+    .result.agents | if type == "array" then . else error("agents") end
+    | map(if type == "object" then . else error("agent") end
+          | {cwd: (.cwd | loc), fcwd: (.foreground_cwd | loc), st: .agent_status,
+             name: (.name // .agent // ""), ws: (.workspace_id // "")})' 2>/dev/null) || return 1
+  [ -n "$AGENTS_JSON" ] && AGENTS_OK=1
+}
+# owner(경로): 그 경로를 포함하는 워크트리 중 가장 긴 것. 비교 대상은 변수에 고정한다 — 파이프 안의 '.'은 경로 자신이 된다
+AGENT_OWNER_JQ='($all | split("\n") | map(select(length>0))) as $wts
+  | def loc: if type == "string" and startswith("/") then . else null end;
+  def owner($p): if $p == null then null else [$wts[] as $w | select($p == $w or ($p | startswith($w + "/"))) | $w] | max_by(length) end;
+  input | if type == "array" then . else error("agents") end
+  | map(if type == "object" then . else error("agent") end | .cwd |= loc | .fcwd |= loc)'
+busy_agent_in() { # busy_agent_in <worktree> <이 저장소의 워크트리 목록(줄바꿈)> → idle 아닌 에이전트가 그 워크트리에 있으면 설명 출력.
+  # 위치를 모르는 작업 중 에이전트는 어느 워크트리에서든 점유로 본다. 판정 자체가 실패하면 비영 종료 (호출자가 보류)
+  local cklock="$STATE/ckpt-lock-$(hash "$1")"
+  if [ -f "$cklock" ] && ! flock -n "$cklock" true; then
+    printf 'checkpoint:working@%s\n' "$1"
+  fi
+  jq -rn --arg wt "$1" --arg all "$2" "$AGENT_OWNER_JQ"'
+    | [ .[] | select(.st != "idle" and .st != "done")
+            | select(owner(.cwd) == $wt or owner(.fcwd) == $wt or (.cwd == null and .fcwd == null))
+            | "\(.name):\(.st)@\(.cwd // .fcwd // "위치 불명")" ] | join(", ")' <<< "$AGENTS_JSON"
+}
+agent_workspace_in() { # agent_workspace_in <worktree> <워크트리 목록> → 그 워크트리 에이전트의 workspace (작업 중인 쪽 우선). 일치 없음 = 빈 출력, 판정 실패 = 비영 종료
+  jq -rn --arg wt "$1" --arg all "$2" "$AGENT_OWNER_JQ"'
+    | [ .[] | select((.ws // "") != "") | select(owner(.cwd) == $wt or owner(.fcwd) == $wt) ]
+    | sort_by(if .st == "idle" or .st == "done" then 1 else 0 end) | (.[0].ws // "")' <<< "$AGENTS_JSON"
+}
+
+# ---- commit 단계 (워크트리 단위) ----
+log_hoc_result() { # log_hoc_result <run> <rc> <hoc 원문 임시파일>: 원문은 HLOG, 분류 가능한 CCG 결과는 구조화 로그에 남긴다.
+  local run=$1 rc=$2 raw=$3 artifact result outcome denials denial terminal cost
+  [ -f "$raw" ] || { log "HOC run=$run rc=$rc artifact=- result=raw-capture-unavailable"; return; }
+  artifact=$(sed -n 's/.*로그 보존: //p' "$raw" | tail -n 1)
+  if [ -z "$artifact" ] || [ ! -f "$artifact/result.json" ]; then
+    log "HOC run=$run rc=$rc artifact=- result=unavailable"
+    return
+  fi
+  result="$artifact/result.json"
+  if ! jq -e '.type == "result"' "$result" >/dev/null 2>&1; then
+    log "CCG run=$run rc=$rc artifact=$result result=invalid"
+    return
+  fi
+  outcome=$(jq -r '.structured_output.outcome // "-"' "$result")
+  denials=$(jq -r '(.permission_denials // []) | length' "$result")
+  denial=$(jq -r '[(.permission_denials // [])[] | (.tool_name + ":" + ((.tool_input.command // "-") | split(" ") | .[0:2] | join("_")))] | if length == 0 then "-" else join(",") end' "$result" | tr '[:space:]' '_' | sed 's/_$//')
+  terminal=$(jq -r '.terminal_reason // "-"' "$result")
+  cost=$(jq -r '.total_cost_usd // "-"' "$result")
+  log "CCG run=$run rc=$rc artifact=$result outcome=$outcome denials=$denials denial=$denial terminal=$terminal cost_usd=$cost"
+}
+
+inflight_file() { printf '%s/inflight-%s' "$STATE" "$(hash "$1")"; }
+inflight_hold() { # inflight_hold <root>: 결과를 끝까지 확인하지 못한 hoc 실행 기록이 있으면 0 — 사람이 확인할 때까지 이 저장소의 자동 commit/push를 막는다
+  [ -e "$(inflight_file "$1")" ] || return 1
+  note "inflight:$1" "hoc 실행 결과를 확인하지 못한 기록 → 자동 commit/push 중단: $1 — autocommit audit 으로 확인 후 autocommit unblock $1" || true
+  return 0   # 알림 실패와 무관하게 막는다
+}
+mark_nopush() { # mark_nopush <root> <branch> <사유>: push 금지 마커. 기존 사유는 지우지 않고 덧붙인다
+  local f="$STATE/nopush-$(hash "$1:$2")" old="" nl=$'\n'
+  if [ -f "$f" ]; then old=$(cat "$f") || return 1; fi
+  write_state "$f" "${old:+$old$nl}$3"
+}
+commit_head() { # 아직 커밋이 없는 브랜치만 UNBORN으로 구분한다. 깨진 ref와 조회 오류는 실패로 남긴다.
+  git -C "$1" rev-parse --verify 'HEAD^{commit}' 2>/dev/null && return 0
+  [ "$(git -C "$1" symbolic-ref --short -q HEAD 2>/dev/null)" = "$2" ] || return 1
+  git -C "$1" show-ref --verify --quiet "refs/heads/$2" 2>/dev/null
+  [ "$?" = 1 ] || return 1
+  echo UNBORN
+}
+run_hoc() { # run_hoc <wt> <branch> <root>: hoc -c 실행 후 전후 HEAD·브랜치·직선성 검증. 문제면 push 금지 마커.
+  # hoc 전에 저장소 단위 실행 기록(inflight)을 쓰고, 결과를 끝까지 확인했거나 위반을 마커에 모두 남긴 경우에만 지운다.
+  # 중단·사후 조회 실패·detached로 결과가 불명확하면 기록이 남아 inflight_hold가 이 저장소를 막는다. 기록은 key=value 줄이며 source하지 않는다
+  local wt=$1 br=$2 root=$3 pre post post_br rc run raw prompt inflight merges lin msg range
+  prompt="자동 커밋 루프에서 호출됨. 완료되고 저장소 규칙에 따른 검증이 확인된 논리 단위만 atomic한 Conventional Commits로 커밋한다. 검증 여부가 불명확하거나 미완성인 변경은 남기고 이유를 출력한다. 비밀·대용량·빌드 산출물처럼 커밋하면 안 될 파일은 커밋하지 말고 파일명만 출력한다. 브랜치를 바꾸거나 만들지 않는다. 기존 커밋을 amend/reset/rebase/merge하지 않고 새 커밋만 만든다. AI/tool attribution trailer를 추가하지 않는다."
+  inflight=$(inflight_file "$root")
+  pre=$(commit_head "$wt" "$br") || { log "WARN  $wt [$br] HEAD 조회 실패 — hoc 생략"; return 1; }
+  run="$(date +%Y%m%dT%H%M%S)-$(hash "$wt:$br:$pre:$NOW")"
+  write_state "$inflight" "run=$run"$'\n'"root=$root"$'\n'"worktree=$wt"$'\n'"branch=$br"$'\n'"head=$pre"$'\n'"started=$NOW" \
+    || { note "inflight-write:$root" "hoc 실행 기록을 쓰지 못해 hoc를 시작하지 않음: $wt [$br] — 상태 디렉터리 확인($STATE)"; return 1; }
+  raw=$(mktemp "$STATE/.hoc-output.XXXXXXXX") || raw=
+  log "COMMIT $wt [$br] pre=${pre:0:10} run=$run → hoc -c"
+  if [ -n "$raw" ]; then
+    ( cd "$wt" && HOC_TIMEOUT=${AC_HOC_TIMEOUT:-900000} HOC_KEEP_LOG=1 "$HOC" -c "$prompt" ) 2>&1 | tee -a "$HLOG" "$raw"
+  else
+    ( cd "$wt" && HOC_TIMEOUT=${AC_HOC_TIMEOUT:-900000} HOC_KEEP_LOG=1 "$HOC" -c "$prompt" ) 2>&1 | tee -a "$HLOG"
+  fi
+  rc=${PIPESTATUS[0]}
+  log_hoc_result "$run" "$rc" "$raw"
+  [ -z "$raw" ] || rm -f "$raw"
+  post=$(commit_head "$wt" "$br") \
+    || { note "hoc-unknown:$root" "hoc 뒤 HEAD 조회 실패: $wt [$br] run=$run — 실행 기록 유지, 자동 commit/push 중단 (autocommit audit)"; return 1; }
+  post_br=$(git -C "$wt" symbolic-ref --short -q HEAD 2>/dev/null)
+  case $? in
+    0) ;;
+    1) mark_nopush "$root" "$br" "detached HEAD after hoc: $br pre=$pre post=$post run=$run at $NOW"   # 커밋이 어느 브랜치로 갈지 모른다
+       note "hoc-detached:$wt" "hoc 뒤 detached HEAD: $wt [$br] — push 금지, 실행 기록 유지 (autocommit audit)"; return 1 ;;
+    *) note "hoc-unknown:$root" "hoc 뒤 브랜치 조회 실패: $wt [$br] run=$run — 실행 기록 유지 (autocommit audit)"; return 1 ;;
+  esac
+  if [ "$post_br" != "$br" ]; then   # 원래 브랜치와 관측된 대상 브랜치를 모두 막는다. 하나라도 못 남기면 저장소 기록을 유지한다
+    msg="branch changed $br → $post_br by hoc pre=$pre post=$post run=$run at $NOW"
+    mark_nopush "$root" "$br" "$msg" && mark_nopush "$root" "$post_br" "$msg" && rm -f "$inflight"
+    note "hoc-branch:$wt" "hoc가 브랜치를 바꿈: $wt $br → $post_br — 두 브랜치 push 금지 (autocommit unblock $root $br / $post_br)"; return 1
+  fi
+  if [ "$rc" -ne 0 ] && [ "$post" != "$pre" ]; then
+    mark_nopush "$root" "$br" "hoc failed rc=$rc but HEAD moved $pre → $post run=$run at $NOW" && rm -f "$inflight"
+    note "hoc-fail-moved:$wt" "hoc 실패(rc=$rc)인데 HEAD 이동: $wt [$br] — push 금지 (autocommit unblock $root $br)"; return 1
+  fi
+  [ "$rc" -ne 0 ] && { rm -f "$inflight"; note "hoc-fail:$wt" "커밋 실패(rc=$rc): $wt [$br] — 로그 $LOG"; return 1; }   # 브랜치·HEAD 그대로 — cooldown 뒤 재시도
+  [ "$post" = "$pre" ] && { rm -f "$inflight"; log "nochg $wt [$br] (hoc가 커밋을 만들지 않음)"; return 2; }
+  range="$pre..$post"; lin=0
+  if [ "$pre" = UNBORN ]; then range=$post
+  else git -C "$wt" merge-base --is-ancestor "$pre" "$post" 2>/dev/null; lin=$?; fi
+  if [ "$lin" = 0 ]; then merges=$(git -C "$wt" rev-list --merges "$range" 2>/dev/null) || lin=128; [ -z "${merges:-}" ] || lin=1; fi
+  case $lin in
+    0) ;;
+    1) mark_nopush "$root" "$br" "non-linear $pre → $post run=$run at $NOW" && rm -f "$inflight"
+       note "hoc-nonlinear:$wt" "hoc 결과가 직선 이력이 아님: $wt [$br] — push 금지 (autocommit unblock $root $br)"; return 1 ;;
+    *) note "hoc-unknown:$root" "hoc 결과 직선성 확인 실패: $wt [$br] run=$run — 실행 기록 유지 (autocommit audit)"; return 1 ;;
+  esac
+  rm -f "$inflight"
+  log "ok    $wt [$br] 새 커밋 $(git -C "$wt" rev-list --count "$range")개:"; git -C "$wt" log --oneline "$range" 2>/dev/null | sed 's/^/        /' | tee -a "$LOG" >&2
+  return 0
+}
+commit_stage() {
+  local root=$1 cglobs=$2 wts=$3 wt br op busy fkey nkey n rc last_fail
+  while IFS= read -r wt; do
+    [ -n "$wt" ] && [ -d "$wt" ] || continue
+    inflight_hold "$root" && return 0                 # 앞 워크트리의 hoc 결과가 불명확하면 이 틱의 나머지도 멈춘다
+    br=$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null) || { once "det:$wt" "skip  $wt (detached HEAD)"; continue; }
+    glob_match "$cglobs" "$br" || { once "cbr:$wt:$br" "skip  $wt [$br] (commit 허용 브랜치 아님)"; continue; }
+    [ -n "$(git --no-optional-locks -C "$wt" status --porcelain 2>/dev/null)" ] || {
+      [ "$DRY" = 1 ] || rm -f "$STATE/fp-$(hash "$wt")" "$STATE/nochg-$(hash "$wt")" "$STATE/dirty-$(hash "$wt")" "$STATE/ckpt-$(hash "$wt")"
+      continue
+    }
+    checkpoint_notice "$wt" "$br" "$wts"
+    op=$(in_progress "$wt"); [ -n "$op" ] && { log "hold  $wt [$br] ($op 진행 중)"; continue; }
+    n=$(git --no-optional-locks -C "$wt" status --porcelain | wc -l)
+    fkey="$STATE/fail-$(hash "$wt")"
+    if [ -f "$fkey" ]; then
+      last_fail=$(cat "$fkey")
+      if ! valid_time "$last_fail"; then
+        [ "$DRY" = 1 ] || write_state "$fkey" "$NOW"
+        log "hold  $wt [$br] (실패 시각 기록 손상, cooldown 재시작)"; continue
+      fi
+      [ $((NOW - last_fail)) -lt "$FAIL_COOLDOWN" ] && { log "hold  $wt [$br] (최근 실패, cooldown)"; continue; }
+    fi
+    load_agents || { note "agents" "herdr agent list 실패 — 이 틱의 commit 단계 중단"; return 1; }   # 후보마다 재조회 (틱이 길어져도 최신)
+    busy=$(busy_agent_in "$wt" "$wts") || { note "agents-judge:$wt" "에이전트 점유 판정 실패 → commit 보류: $wt [$br]"; continue; }
+    [ -n "$busy" ] && { log "hold  $wt [$br] (에이전트 작업 중: $busy)"; continue; }
+    if ! settled "$wt"; then
+      if [ "$DRY" = 1 ]; then log "cand  $wt [$br] ($n 변경, settle ${AGE}s/${SETTLE}s — plan은 지문을 기록하지 않음)"; else log "wait  $wt [$br] ($n 변경, settle ${AGE}s/${SETTLE}s)"; fi
+      continue
+    fi
+    nkey="$STATE/nochg-$(hash "$wt")"
+    if [ -f "$nkey" ] && [ "$(cat "$nkey")" = "$FP" ]; then      # 직전에 hoc이 "커밋할 것 없음"이라 한 상태 그대로면 다시 부르지 않는다
+      once "nochg:$wt" "skip  $wt [$br] ($n 변경, hoc이 커밋하지 않은 상태 그대로 — 워크트리가 바뀌어야 다시 호출)"
+      continue
+    fi
+    [ "$DRY" = 1 ] && { log "PLAN  commit $wt [$br] ($n 변경, settle ${AGE}s)"; continue; }
+    run_hoc "$wt" "$br" "$root"; rc=$?
+    case $rc in
+      0) rm -f "$fkey" "$STATE/fp-$(hash "$wt")" ;;              # 커밋됨 — settle 지문을 지워 다음 변경부터 다시 센다.
+                                                                 # nochg 지문은 남긴다: 커밋 후 남는 잔여물(hoc이 커밋하지 않기로 한 미추적 더미)이
+                                                                 # 이전 nochg 상태와 지문이 같으면 다시 부를 이유가 없다. 지우면 매 커밋마다 확실히 실패할 호출을 한 번씩 더 한다
+      2) echo "$FP" > "$nkey"; rm -f "$fkey" ;;                  # 커밋 안 만듦 — 지문을 남겨 같은 상태의 재호출을 막는다
+      *) write_state "$fkey" "$NOW" ;;                           # 실패 — 기존 cooldown
+    esac
+    NOW=$(date +%s)
+  done <<< "$wts"
+}
+
+# ---- push 단계 (브랜치 단위, 캡처 SHA 고정) ----
+push_worktree_ready() {
+  local root=$1 br=$2 cglobs=${3:-'*'} wts wt busy status op
+  PUSH_HOLD=
+  load_agents || { PUSH_HOLD="herdr 에이전트 조회 실패"; return 1; }
+  wts=$(worktrees_of "$root") || { PUSH_HOLD="워크트리 목록 조회 실패"; return 1; }
+  wt=$(worktree_of_branch "$root" "$br") || { PUSH_HOLD="브랜치 워크트리 조회 실패"; return 1; }
+  [ -n "$wt" ] || return 0
+  op=$(in_progress "$wt"); [ -n "$op" ] && { PUSH_HOLD="$op 진행 중"; return 1; }
+  busy=$(busy_agent_in "$wt" "$wts") || { PUSH_HOLD="에이전트 점유 판정 실패"; return 1; }
+  [ -z "$busy" ] || { PUSH_HOLD="에이전트 작업 중: $busy"; return 1; }
+  status=$(git --no-optional-locks -C "$wt" status --porcelain --untracked-files=no 2>/dev/null) \
+    || { PUSH_HOLD="Git 상태 조회 실패"; return 1; }
+  [ -z "$status" ] || [ "$cglobs" = - ] || { PUSH_HOLD="추적 파일의 미커밋 변경 있음"; return 1; }
+}
+push_settle_reset() {
+  [ "$DRY" = 1 ] || rm -f "$STATE/push-fp-$(hash "$1:$2")"
+}
+push_settled() { # 커밋 시각 대신 관측된 SHA의 안정 시간을 쓴다. amend/reset도 대기를 다시 시작한다.
+  local root=$1 br=$2 sha=$3 f prev="" first=""
+  PUSH_AGE=0
+  [ "$MODE" = push-only ] && return 0   # 사람이 기존 커밋의 즉시 push를 명시한 모드. 나머지 검증은 동일하다.
+  NOW=$(date +%s)   # 앞 저장소의 hoc/원격 조회로 길어진 tick의 시작 시각을 재사용하지 않는다.
+  f="$STATE/push-fp-$(hash "$root:$br")"
+  [ -f "$f" ] && read -r prev first < "$f"
+  if [ "$prev" != "$sha" ] || ! valid_time "$first"; then
+    first=$NOW
+    if [ "$DRY" != 1 ]; then write_state "$f" "$sha $first" || return 1; fi
+  fi
+  PUSH_AGE=$((NOW - first)); [ "$PUSH_AGE" -ge "$SETTLE" ]
+}
+unsafe_files() { # unsafe_files <root> <from> <to>: from..to로 새로 게시될 모든 커밋에서 추가·수정·타입 변경된 항목 중 금지 경로·크기 초과 출력.
+  # 양 끝 트리만 비교하면 중간 커밋에서 추가했다 지우거나 줄인 파일도 이력째 게시된다. merge는 부모마다(-m) 비교하고,
+  # 이름 변경 탐지는 끈다(삭제+추가로 나와 새 경로가 검사된다). 경로는 NUL 구분으로만 다룬다.
+  # 검사 자체가 실패하면(조회·해석·객체 확인 실패) 빈 출력으로 통과시키지 않고 사유를 출력해 push를 보류시킨다 (fail-closed).
+  local root=$1 from=$2 to=$3 i n p oid type sz key max=$((MAX_FILE_MB*1024*1024))
+  local -a recs=() paths=() oids=() hits=() lines=()
+  local -A uniq=() size=() seen=()
+  mapfile -d '' -t recs < <(git -C "$root" log --no-renames -m --root --raw -z --no-abbrev --format= --diff-filter=AMT \
+                              "$from..$to" -- 2>/dev/null; printf 'end:%s\0' "$?")
+  n=${#recs[@]}
+  [ "${recs[n-1]}" = end:0 ] || { echo "scan failed: 이력 조회 ${from:0:10}..${to:0:10}"; return; }
+  for ((i=0; i<n-1; i++)); do
+    [ -n "${recs[i]}" ] || continue
+    [[ "${recs[i]}" =~ ^:[0-7]{6}\ ([0-7]{6})\ [0-9a-f]{40,64}\ ([0-9a-f]{40,64})\ [AMT]$ ]] && [ $((i+1)) -lt $((n-1)) ] \
+      || { echo "scan failed: 이력 해석 불가 (${recs[i]:0:60})"; return; }
+    i=$((i+1)); paths+=("${recs[i]}")
+    if [ "${BASH_REMATCH[1]}" = 160000 ]; then oids+=(-)            # gitlink(서브모듈 커밋)는 blob이 아니다 — 경로만 검사
+    else oids+=("${BASH_REMATCH[2]}"); uniq[${BASH_REMATCH[2]}]=1; fi
+  done
+  [ "${#paths[@]}" -gt 0 ] || return                 # 추가·수정 항목 없음(삭제만) — 검사할 대상이 없는 정상 상태
+  mapfile -d '' -t hits < <(printf '%s\0' "${paths[@]}" | grep -zE -- "$FORBID"; printf 'end:%s\0' "$?")
+  case "${hits[-1]}" in end:0|end:1) ;; *) echo "scan failed: 금지 경로 검사 (AC_FORBID)"; return ;; esac
+  for p in "${hits[@]:0:${#hits[@]}-1}"; do
+    [ -z "${seen[f:$p]:-}" ] || continue; seen[f:$p]=1
+    printf 'forbidden: %s\n' "${p//$'\n'/\\n}"
+  done
+  [ "${#uniq[@]}" -gt 0 ] || return
+  mapfile -t lines < <(printf '%s\n' "${!uniq[@]}" | git -C "$root" cat-file --batch-check='%(objectname) %(objecttype) %(objectsize)' 2>/dev/null; echo "end:$?")
+  [ "${lines[-1]}" = end:0 ] && [ "${#lines[@]}" -eq $((${#uniq[@]} + 1)) ] \
+    || { echo "scan failed: 객체 조회 ${#uniq[@]}개 (결과 $((${#lines[@]} - 1))줄)"; return; }
+  for ((i=0; i<${#lines[@]}-1; i++)); do
+    read -r oid type sz <<< "${lines[i]}"
+    [ -n "${uniq[$oid]:-}" ] && [ "$type" = blob ] && [[ "$sz" =~ ^[0-9]+$ ]] || { echo "scan failed: 객체 조회 (${lines[i]:0:80})"; return; }
+    size[$oid]=$sz
+  done
+  for ((i=0; i<${#paths[@]}; i++)); do
+    oid=${oids[i]}; [ "$oid" != - ] || continue
+    [ "${size[$oid]}" -gt "$max" ] || continue
+    key="s:$oid:${paths[i]}"; [ -z "${seen[$key]:-}" ] || continue; seen[$key]=1
+    printf 'too large (%dMB): %s\n' "$((size[$oid] / 1048576))" "${paths[i]//$'\n'/\\n}"
+  done
+}
+remote_destination_ok() { # remote_destination_ok <root> <remote>: 실제 push 목적지가 하나뿐이고 fetch URL과 같으며 허용 목록에 맞으면 0.
+  # 아니면 REMOTE_HOLD_KEY·REMOTE_HOLD에 사유를 남긴다. push 실행과 tidy의 "원격에 이미 포함" 판정이 같이 쓴다
+  local root=$1 remote=$2 fetchurl pushurls
+  REMOTE_HOLD_KEY=; REMOTE_HOLD=
+  fetchurl=$(git -C "$root" remote get-url "$remote" 2>/dev/null) \
+    || { REMOTE_HOLD_KEY=no-remote; REMOTE_HOLD="원격 '$remote' 없음: $root"; return 1; }
+  pushurls=$(git -C "$root" remote get-url --push --all "$remote" 2>/dev/null) \
+    || { REMOTE_HOLD_KEY=pushurl; REMOTE_HOLD="push URL 조회 실패 → 중단: $root"; return 1; }
+  [ "$(grep -c . <<< "$pushurls")" -eq 1 ] \
+    || { REMOTE_HOLD_KEY=pushurl-multi; REMOTE_HOLD="push 목적지가 $(grep -c . <<< "$pushurls")개 → 중단: $root ($remote) — 자동 push는 단일 목적지만 허용"; return 1; }
+  [ "$fetchurl" = "$pushurls" ] || { REMOTE_HOLD_KEY=pushurl; REMOTE_HOLD="fetch URL과 pushurl이 다름 → 중단: $root ($fetchurl vs $pushurls)"; return 1; }
+  [ -n "$REMOTE_ALLOW" ] || { REMOTE_HOLD_KEY=remote-allow; REMOTE_HOLD="AC_REMOTE_ALLOW 미설정 → push 안 함: $root $fetchurl"; return 1; }
+  grep -qE "$REMOTE_ALLOW" <<< "$fetchurl" || { REMOTE_HOLD_KEY=remote-allow; REMOTE_HOLD="허용되지 않은 원격 → 중단: $root $fetchurl"; return 1; }
+}
+push_stage() {
+  local root=$1 remote=$2 pglobs=$3 cglobs=${4:-'*'} line br up sha trk rsha ab ahead behind out mark bad remotes current
+  PUSH_PENDING=0
+  inflight_hold "$root" && { PUSH_PENDING=1; return; }   # 해제되면 바로 다시 보도록 기본 주기 유지
+  [ "$remote" = - ] && return
+  [ "$PUSH" = 1 ] || { once "nopush-mode:$root" "skip  $root push 단계 (AC_PUSH=0)"; return; }
+  remote_destination_ok "$root" "$remote" || { note "$REMOTE_HOLD_KEY:$root" "$REMOTE_HOLD"; return; }
+  remotes=$(timeout "$REMOTE_TIMEOUT" git -C "$root" ls-remote --heads "$remote" 2>/dev/null) || { note "ls-remote:$root" "ls-remote 실패/timeout → 이 틱 push 보류: $root"; return; }
+  while IFS=$'\t' read -r br up; do
+    [ -n "$br" ] || continue
+    glob_match "$pglobs" "$br" || continue
+    [ -n "$up" ] || { once_at "$NOTE_LONG" "noup:$root:$br" "info  $root [$br] upstream 없음 → 자동 push 제외 (git push -u $remote $br 로 한 번 지정하면 이후 자동)"; continue; }
+    [ "$up" = "$remote/$br" ] || { once_at "$NOTE_LONG" "upname:$root:$br" "skip  $root [$br] upstream이 $up (같은 이름 $remote/$br 아님) → 자동 push 제외"; continue; }
+    sha=$(git -C "$root" rev-parse "refs/heads/$br" 2>/dev/null) || continue          # 판정 시점 SHA 고정
+    trk=$(git -C "$root" rev-parse "refs/remotes/$remote/$br" 2>/dev/null) || continue
+    ab=$(git -C "$root" rev-list --left-right --count "$trk...$sha" 2>/dev/null) || continue
+    behind=${ab%%	*}; ahead=${ab##*	}
+    [ "$ahead" -gt 0 ] || continue
+    PUSH_PENDING=1
+    mark="$STATE/nopush-$(hash "$root:$br")"
+    [ -f "$mark" ] && { once "marked:$root:$br" "hold  $root [$br] push 금지 마커: $(cat "$mark") (autocommit unblock $root $br)"; continue; }
+    rsha=$(awk -v r="refs/heads/$br" '$2==r{print $1}' <<< "$remotes")
+    [ -n "$rsha" ] || { note "remote-missing:$root:$br" "원격에 브랜치 없음(삭제됨?) → push 보류: $root [$br]"; continue; }
+    [ "$rsha" = "$trk" ] || { note "stale:$root:$br" "원격이 로컬 추적 ref와 다름(git fetch 필요) → push 보류: $root [$br] remote=${rsha:0:10} local=${trk:0:10}"; continue; }
+    [ "$behind" -gt 0 ] && { note "diverged:$root:$br" "push 보류(원격과 갈라짐 -$behind/+$ahead): $root [$br] — 수동 rebase/merge 필요"; continue; }
+    if ! push_worktree_ready "$root" "$br" "$cglobs"; then
+      push_settle_reset "$root" "$br"; log "hold  $root [$br] push 보류 ($PUSH_HOLD)"; continue
+    fi
+    if ! push_settled "$root" "$br" "$sha"; then
+      log "wait  $root [$br] push SHA 안정화 ${PUSH_AGE}s/${SETTLE}s"; continue
+    fi
+    bad=$(unsafe_files "$root" "$trk" "$sha"); [ -n "$bad" ] && { note "unsafe:$root:$br" "push 보류(위험 파일): $root [$br] — $(brief "$bad") (전체 목록은 autocommit audit)"; continue; }
+    if ! push_worktree_ready "$root" "$br" "$cglobs"; then
+      push_settle_reset "$root" "$br"; log "hold  $root [$br] push 직전 보류 ($PUSH_HOLD)"; continue
+    fi
+    current=$(git -C "$root" rev-parse "refs/heads/$br" 2>/dev/null) || { push_settle_reset "$root" "$br"; continue; }
+    [ "$current" = "$sha" ] || { push_settle_reset "$root" "$br"; log "hold  $root [$br] push 검사 중 브랜치 SHA 변경"; continue; }
+    [ "$DRY" = 1 ] && { log "PLAN  push $root $br ${sha:0:10} → $remote/$br (+$ahead)"; continue; }
+    log "PUSH  $root $br ${sha:0:10} → $remote/$br (+$ahead)"
+    out=$(timeout "$PUSH_TIMEOUT" git -C "$root" push --recurse-submodules=no "$remote" "$sha:refs/heads/$br" 2>&1)   # 서브모듈 원격은 검사한 목적지가 아니다
+    case $? in
+      0)   log "ok    $root [$br] pushed ${sha:0:10}"; push_settle_reset "$root" "$br"; rm -f "$STATE/note-$(hash "diverged:$root:$br")" "$STATE/note-$(hash "stale:$root:$br")" ;;
+      124) log "retry $root [$br] (네트워크 timeout, 다음 주기 재시도)" ;;
+      *)   if grep -qiE 'rejected|non-fast-forward|fetch first|denied|permission|protected|403' <<< "$out"; then note "push-rejected:$root:$br" "push 거절: $root [$br] — $(tail -1 <<< "$out")"
+           else log "retry $root [$br] ($(tail -1 <<< "$out"))"; fi ;;
+    esac
+  done < <(git -C "$root" for-each-ref --format='%(refname:short)	%(upstream:short)' refs/heads 2>/dev/null)
+}
+
+# ---- 설정에 없는 저장소 탐지 (읽기 전용) ----
+covered_dirs() { # 설정에 적힌 경로의 git-common-dir. 주석 처리된 제외 행도 '이미 판단함'으로 쳐서 다시 보고하지 않는다
+  local line path root c
+  while IFS= read -r line; do
+    line=${line#\#}; line=${line#"${line%%[![:space:]]*}"}
+    case "$line" in '~'*|/*) ;; *) continue ;; esac
+    read -r path _ <<< "$line"
+    root=$(expand "$path"); [ -d "$root" ] || continue
+    c=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || continue
+    [ "${c#/}" = "$c" ] && c="$root/$c"
+    realpath "$c" 2>/dev/null
+  done < "$CONF"
+}
+scan_ignored() { # 사람이 scan-ignore에 적어 이미 판단을 끝낸 경로면 0. 각 줄은 ~ 축약 경로 또는 glob
+  local disp=$1 line
+  [ -f "$SCAN_IGNORE" ] || return 1
+  while IFS= read -r line; do
+    line=${line%%#*}; line=${line#"${line%%[![:space:]]*}"}; line=${line%"${line##*[![:space:]]}"}
+    [ -n "$line" ] || continue
+    case "$disp" in $line) return 0 ;; esac
+  done < "$SCAN_IGNORE"
+  return 1
+}
+scan() { # 설정에 없는 git 저장소를 "경로 [브랜치] 변경 N 원격" 형식으로 출력. 아무것도 고치지 않는다
+  local known gd root c br n url disp
+  known=$(covered_dirs | sort -u)
+  while IFS= read -r gd; do
+    root=${gd%/.git}
+    c=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null) || continue
+    [ "${c#/}" = "$c" ] && c="$root/$c"; c=$(realpath "$c" 2>/dev/null) || continue
+    grep -qxF "$c" <<< "$known" && continue
+    known="$known"$'\n'"$c"                       # 같은 저장소의 다른 워크트리를 중복 보고하지 않는다
+    disp=${root/#$HOME/\~}
+    scan_ignored "$disp" && continue
+    br=$(git -C "$root" symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)
+    n=$(git --no-optional-locks -C "$root" status --porcelain 2>/dev/null | wc -l)
+    url=$(git -C "$root" remote get-url origin 2>/dev/null) || url='(원격 없음)'
+    echo "$disp  [$br] 변경 $n  $url"
+  done < <(find $SCAN_ROOTS -maxdepth "$SCAN_DEPTH" \
+             \( -name node_modules -o -name .venv -o -name .cache -o -name .npm -o -name .cargo \
+                -o -name .rustup -o -name .nvm -o -name .bun -o -name .pyenv -o -name .worktrees \) -prune \
+             -o -name .git -print 2>/dev/null | sort -u)
+}
+scan_tick() { # loop 안에서 SCAN_INTERVAL마다 한 번. 발견해도 설정은 사람이 고친다
+  local f="$STATE/last-scan" prev found summary
+  [ "$SCAN_INTERVAL" -gt 0 ] || return
+  prev=$(cat "$f" 2>/dev/null || echo 0)
+  valid_time "$prev" || prev=0
+  [ $((NOW - prev)) -ge "$SCAN_INTERVAL" ] || return
+  write_state "$f" "$NOW" || return 1
+  found=$(scan)
+  [ -n "$found" ] || { log "scan  설정에 없는 저장소 없음"; return; }
+  log "SCAN  설정에 없는 저장소 $(grep -c . <<< "$found")개:"; sed 's/^/        /' <<< "$found" | tee -a "$LOG" >&2
+  summary=$(brief "$(sed 's/  \[.*//' <<< "$found")")
+  note "scan" "새 저장소 $(grep -c . <<< "$found")개: $summary — autocommit scan 으로 확인 후 repos.conf에 추가"
+}
+
+# ---- 일일 점검 (읽기 전용) ----
+# 매 틱 로그는 "지금 이 순간"만 보여줘서, 스스로 풀리지 않는 상태(사람이 손대야 끝나는 것)를 가려낼 수 없다.
+# audit은 그런 상태만 모아 붙여넣을 명령과 함께 출력한다. 아무것도 고치지 않는다 — 교정은 사람이 한다.
+age_days() { local f=$1 t; t=$(stat -c %Y "$f" 2>/dev/null || echo "$NOW"); echo $(( (NOW - t) / 86400 )); }
+gh_visibility() { # gh_visibility <remote url>: PUBLIC/PRIVATE/INTERNAL 또는 빈 문자열(조회 불가)
+  local url=$1 slug
+  command -v gh >/dev/null || return 0
+  slug=$(sed -E 's#^.*github\.com[:/]+##; s#\.git$##' <<< "$url")
+  case "$slug" in */*) ;; *) return 0 ;; esac
+  timeout 20 gh repo view "$slug" --json visibility -q .visibility 2>/dev/null || true
+}
+audit_push_holds() { # 사람이 손대야만 풀리는 push 보류. 원격 1회 조회
+  local root=$1 remote=$2 pglobs=$3 disp br up sha trk ab behind ahead remotes rsha mark bad nb
+  [ "$remote" = - ] && return
+  disp=${root/#$HOME/\~}
+  remotes=$(timeout "$REMOTE_TIMEOUT" git -C "$root" ls-remote --heads "$remote" 2>/dev/null) \
+    || { echo "- $disp  원격 조회 실패($remote) — 네트워크·인증 확인"; return; }
+  while IFS=$'\t' read -r br up; do
+    [ -n "$br" ] || continue
+    glob_match "$pglobs" "$br" || continue
+    [ "$up" = "$remote/$br" ] || continue
+    mark="$STATE/nopush-$(hash "$root:$br")"
+    [ -f "$mark" ] && { echo "- $disp [$br]  hoc 검증 실패로 push 금지 $(age_days "$mark")일째: $(cat "$mark")"; echo "    해제  autocommit unblock $root $br   (loop를 멈춘 뒤 실행)"; continue; }
+    sha=$(git -C "$root" rev-parse "refs/heads/$br" 2>/dev/null) || continue
+    trk=$(git -C "$root" rev-parse "refs/remotes/$remote/$br" 2>/dev/null) || continue
+    ab=$(git -C "$root" rev-list --left-right --count "$trk...$sha" 2>/dev/null) || continue
+    behind=${ab%%$'\t'*}; ahead=${ab##*$'\t'}
+    rsha=$(awk -v r="refs/heads/$br" '$2==r{print $1}' <<< "$remotes")
+    if [ -z "$rsha" ]; then
+      [ "$ahead" -gt 0 ] && { echo "- $disp [$br]  원격에 브랜치가 없다(삭제됨?) — +$ahead 커밋이 계속 보류된다"; echo "    내보내려면  git -C $root push -u $remote $br"; }
+    elif [ "$rsha" != "$trk" ]; then
+      echo "- $disp [$br]  추적 ref가 낡아 push가 영구 보류(remote=${rsha:0:10} local=${trk:0:10}) — 루프는 스스로 fetch하지 않는다"
+      echo "    해제  git -C $root fetch $remote"
+    elif [ "$behind" -gt 0 ] && [ "$ahead" -gt 0 ]; then    # behind만이면 push할 것 자체가 없다 — 보류가 아니다
+      echo "- $disp [$br]  원격과 갈라짐 -$behind/+$ahead — 사람이 rebase/merge 해야 풀린다"
+      echo "    확인  git -C $root log --oneline --left-right $up...$br"
+    elif [ "$ahead" -gt 0 ]; then
+      # push 경로와 똑같은 판정식을 쓴다. 위험 파일 보류는 커밋이 계속 쌓여도 스스로 풀리지 않는다
+      bad=$(unsafe_files "$root" "$trk" "$sha")
+      if [ -n "$bad" ]; then
+        nb=$(grep -c . <<< "$bad")
+        echo "- $disp [$br]  위험 파일 ${nb}건으로 push 보류 — +$ahead 커밋이 계속 쌓인다"
+        head -5 <<< "$bad" | sed 's/^/    /'
+        [ "$nb" -gt 5 ] && echo "    … 외 $((nb-5))건"
+      fi
+    fi
+  done < <(git -C "$root" for-each-ref --format='%(refname:short)	%(upstream:short)' refs/heads 2>/dev/null)
+}
+audit() {
+  NOW=${NOW:-$(date +%s)}
+  local line path cglobs remote pglobs extra root nf disp vis f k n
+  echo "==== autocommit 점검 $(date '+%F %T') ===="
+  echo "[설정 행]"
+  while IFS= read -r line; do
+    line=${line%%#*}; [ -n "${line//[[:space:]]/}" ] || continue
+    read -r path cglobs remote pglobs extra <<< "$line"
+    nf=$(wc -w <<< "$line")
+    { [ "$nf" -lt 3 ] || [ "$nf" -gt 4 ]; } && { echo "- 형식 오류(3~4열): $line"; continue; }
+    root=$(expand "$path"); disp=${root/#$HOME/\~}
+    [ -d "$root" ] || { echo "- 경로 없음: $disp — repos.conf에서 지우거나 경로를 고친다"; continue; }
+    git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "- git 저장소 아님: $disp"; continue; }
+    # 공개 저장소 회귀 — push가 켜진 행의 원격이 PUBLIC이면 이 세션에서 세운 원칙이 깨진 것
+    if [ "$remote" != - ]; then
+      vis=$(gh_visibility "$(git -C "$root" remote get-url "$remote" 2>/dev/null)")
+      [ "$vis" = PUBLIC ] && echo "- 공개 저장소인데 자동 push가 켜져 있다: $disp ($remote) — repos.conf 3열을 '-'로"
+    fi
+  done < "$CONF"
+  echo "[스스로 풀리지 않는 push 보류]"
+  while IFS= read -r line; do
+    line=${line%%#*}; [ -n "${line//[[:space:]]/}" ] || continue
+    read -r path cglobs remote pglobs extra <<< "$line"
+    nf=$(wc -w <<< "$line"); { [ "$nf" -lt 3 ] || [ "$nf" -gt 4 ]; } && continue
+    root=$(expand "$path"); [ -d "$root" ] || continue
+    git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || continue
+    audit_push_holds "$root" "$remote" "${pglobs:-$cglobs}"
+  done < "$CONF"
+  echo "[미해결 hoc 실행 기록]"   # inflight: hoc 결과를 끝까지 확인하지 못했다. 스스로 풀리지 않고 그 저장소의 자동 commit/push를 막는다
+  for f in "$STATE"/inflight-*; do
+    [ -e "$f" ] || continue
+    root=$(sed -n 's/^root=//p' "$f" 2>/dev/null | head -1)
+    [ -n "$root" ] && [ "$(basename "$f")" = "inflight-$(hash "$root")" ] || root=
+    echo "- $(basename "$f") $(age_days "$f")일째 — hoc 결과 미확인(중단·사후 조회 실패·detached 등). ${root:+${root/#$HOME/\~}의 }자동 commit/push 중단"
+    head -c 2000 "$f" | sed 's/^/    /'
+    if [ -n "$root" ]; then
+      echo "    확인  ps -ef | grep '[h]oc' ; git -C $root log --oneline -5 ; git -C $root status --short (hoc 출력 $HLOG)"
+      echo "    해제  autocommit unblock $root   (loop를 멈추고 실행 중인 hoc가 없을 때만 된다)"
+    else
+      echo "    대상 매핑 불명 — 내용 확인 후 지우려면  rm $f"
+    fi
+  done
+  echo "[오래된 마커]"
+  for f in "$STATE"/nochg-* "$STATE"/fail-*; do
+    [ -e "$f" ] || continue
+    [ "$(age_days "$f")" -ge "$STALE_MARKER_DAYS" ] || continue
+    echo "- $(basename "$f") $(age_days "$f")일째 — 같은 변경을 hoc이 계속 커밋하지 않거나 실패가 굳었다"
+  done
+  echo "[남은 임시 탭]"
+  if command -v herdr >/dev/null; then
+    n=$(herdr tab list 2>/dev/null | jq -r '.result.tabs[].label' 2>/dev/null | grep -c '^tmp-' || true)
+    [ "${n:-0}" -gt 0 ] && echo "- hoc이 닫지 않은 tmp-* 탭 ${n}개 — herdr tab list 로 확인 후 close"
+  fi
+  [ -f "$AUDIT_REMIND" ] && { echo "[상기]"; sed 's/^/  참고 /' "$AUDIT_REMIND"; }   # 고정 참고 문구 — 해결할 항목("- ")으로 세지 않는다
+  true
+}
+audit_tick() { # loop 안에서 AUDIT_INTERVAL마다 한 번. 발견해도 고치지 않는다
+  local f="$STATE/last-audit" prev out n
+  [ "$AUDIT_INTERVAL" -gt 0 ] || return
+  prev=$(cat "$f" 2>/dev/null || echo 0)
+  valid_time "$prev" || prev=0
+  [ $((NOW - prev)) -ge "$AUDIT_INTERVAL" ] || return
+  write_state "$f" "$NOW" || return 1
+  tidy                                  # loop가 $STATE/lock을 쥔 채 부른다 — 마커를 쓰는 쪽과 경합하지 않는다
+  out=$(audit)
+  n=$(awk '/^\[/{sec=$0} /^- / && sec!="[상기]"{n++} END{print n+0}' <<< "$out")   # 상기 문구만으로는 알리지 않는다
+  log "AUDIT 점검 항목 ${n}건"; sed 's/^/        /' <<< "$out" | tee -a "$LOG" >&2
+  [ "${n:-0}" -gt 0 ] && note "audit" "autocommit 점검: 사람이 손대야 하는 항목 ${n}건 — autocommit audit"
+  true
+}
+
+# ---- 마커 정리(tidy)와 주간 검토(review) ----
+# 마커 이름은 단방향 해시라 현재 설정·워크트리·브랜치에서 역으로 찾는다. 못 찾은 마커는 지우지 않고 보고만 한다:
+# 브랜치 삭제와 일시적 마운트 부재·설정 행 제외를 구별할 수 없기 때문이다.
+marker_map() { # 이름<TAB>종류<TAB>저장소<TAB>원격<TAB>push glob<TAB>대상(워크트리 또는 브랜치)
+  local line path cglobs remote pglobs extra root nf wt br
+  while IFS= read -r line; do
+    line=${line%%#*}; [ -n "${line//[[:space:]]/}" ] || continue
+    read -r path cglobs remote pglobs extra <<< "$line"
+    nf=$(wc -w <<< "$line"); { [ "$nf" -lt 3 ] || [ "$nf" -gt 4 ]; } && continue
+    root=$(expand "$path"); [ -d "$root" ] || continue
+    git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || continue
+    while IFS= read -r br; do
+      [ -n "$br" ] && printf 'nopush-%s\tnopush\t%s\t%s\t%s\t%s\n' "$(hash "$root:$br")" "$root" "$remote" "${pglobs:-$cglobs}" "$br"
+    done < <(git -C "$root" for-each-ref --format='%(refname:short)' refs/heads 2>/dev/null)
+    while IFS= read -r wt; do
+      [ -n "$wt" ] || continue
+      printf 'nochg-%s\tnochg\t%s\t%s\t%s\t%s\n' "$(hash "$wt")" "$root" "$remote" "${pglobs:-$cglobs}" "$wt"
+      printf 'fail-%s\tfail\t%s\t%s\t%s\t%s\n' "$(hash "$wt")" "$root" "$remote" "${pglobs:-$cglobs}" "$wt"
+    done < <(worktrees_of "$root")
+  done < "$CONF"
+}
+nopush_inert() { # nopush_inert <저장소> <원격> <push glob> <브랜치>: 마커를 지워도 되는 근거가 있으면 출력 — 실제 원격이 이미 그 브랜치를 포함할 때뿐.
+  # push 꺼짐·glob 제외·upstream 불일치는 "지금 비활성"일 뿐 위반이 풀린 것이 아니다. 설정을 되돌리면 다시 막아야 하므로 지우지 않는다
+  local root=$1 remote=$2 br=$4 ref="refs/heads/$4" out rsha sha
+  [ "$remote" = - ] && return
+  remote_destination_ok "$root" "$remote" || return   # push가 쓰는 목적지와 같은 원격인지 먼저 확인한다
+  # 추적 ref는 낡았을 수 있다. 실제 원격 SHA에 이미 포함됐을 때만 "내보낼 것 없음"으로 본다. 조회 실패·객체 없음은 유지
+  # 조회 전체가 성공해야 출력을 믿는다 — 유효한 SHA를 낸 뒤 오류·timeout으로 끝난 조회는 실패로 본다
+  out=$(timeout "$REMOTE_TIMEOUT" git -C "$root" ls-remote --heads "$remote" "$ref" 2>/dev/null) || return
+  rsha=$(awk -v ref="$ref" '$2 == ref { n++; s = $1 } END { if (n == 1) print s }' <<< "$out")
+  [[ "$rsha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || return
+  sha=$(git -C "$root" rev-parse -q --verify "refs/heads/$br" 2>/dev/null) || return
+  git -C "$root" cat-file -e "$rsha^{commit}" 2>/dev/null || return
+  git -C "$root" merge-base --is-ancestor "$sha" "$rsha" 2>/dev/null && echo "원격 $remote/$br(${rsha:0:10})에 이미 포함 — 내보낼 커밋 없음"
+}
+nopush_inactive() { # nopush_inactive <저장소> <원격> <push glob> <브랜치>: 마커가 지금은 막는 push가 없는 이유(표시용). 마커는 보존한다
+  local root=$1 remote=$2 pglobs=$3 br=$4 up
+  [ "$remote" = - ] && { echo "설정상 push 꺼짐"; return; }
+  glob_match "$pglobs" "$br" || { echo "push 허용 브랜치 아님"; return; }
+  up=$(git -C "$root" for-each-ref --format='%(upstream:short)' "refs/heads/$br" 2>/dev/null)
+  [ "$up" = "$remote/$br" ] || echo "upstream이 $remote/$br 아님(${up:-없음})"
+}
+tidy() { # 효과가 없다고 증명되는 마커만 지운다. 호출자가 $STATE/lock을 쥐고 있어야 한다
+  NOW=${NOW:-$(date +%s)}
+  local map f name t row kind root remote pglobs target why n=0
+  for f in "$STATE"/fail-*; do        # commit_stage는 FAIL_COOLDOWN 동안만 막는다 — 지난 fail은 대상과 무관하게 무효
+    [ -f "$f" ] || continue
+    t=$(cat "$f" 2>/dev/null); valid_time "$t" || continue
+    [ $((NOW - t)) -ge "$FAIL_COOLDOWN" ] || continue
+    rm -f "$f"; n=$((n+1)); log "tidy  $(basename "$f") 삭제 (실패 cooldown 만료)"
+  done
+  map=$(marker_map)
+  for f in "$STATE"/nochg-* "$STATE"/nopush-*; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f")
+    row=$(awk -F'\t' -v n="$name" '$1==n{print; exit}' <<< "$map")
+    [ -n "$row" ] || continue
+    IFS=$'\t' read -r _ kind root remote pglobs target <<< "$row"
+    if [ "$kind" = nochg ]; then
+      # status 조회가 실패하면(마운트 없음 등) 지문이 달라 보여도 지우지 않는다
+      git --no-optional-locks -C "$target" status --porcelain >/dev/null 2>&1 || continue
+      [ "$(fingerprint "$target")" = "$(cat "$f")" ] && continue   # 아직 막고 있다 — .gitignore 같은 사람 판단이 필요하다
+      rm -f "$f"; n=$((n+1)); log "tidy  $name 삭제 ($target: 워크트리가 바뀌어 지문 무효)"
+    else
+      why=$(nopush_inert "$root" "$remote" "$pglobs" "$target"); [ -n "$why" ] || continue
+      log "tidy  push 금지 해제: $root [$target] — $why (기존 사유: $(cat "$f"))"; rm -f "$f"; n=$((n+1))
+    fi
+  done
+  log "tidy  정리 ${n}건"
+}
+marker_inventory() { # 남은 마커 전부: 종류·대상·나이·내용, 작동 중인 nochg는 근거(status·.gitignore)까지
+  local map f name row kind root remote pglobs target state why
+  map=$(marker_map)
+  for f in "$STATE"/nopush-* "$STATE"/nochg-* "$STATE"/fail-*; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f")
+    row=$(awk -F'\t' -v n="$name" '$1==n{print; exit}' <<< "$map")
+    # 사람이 볼 항목("- ")은 굳은 것만: STALE_MARKER_DAYS 이상 된 작동 중 nochg·매핑 불명, 그리고 nopush. 나머지는 참고로 싣는다
+    if [ -z "$row" ]; then
+      if [ "${name%%-*}" != fail ] && [ "$(age_days "$f")" -ge "$STALE_MARKER_DAYS" ]; then state="- $name"; else state="  참고 $name"; fi
+      echo "$state $(age_days "$f")일째 — 대상 매핑 불명(브랜치·워크트리 삭제, 설정 행 제외, 마운트 부재 중 하나). 내용: $(head -c 200 "$f")"
+      echo "    지우려면  rm $f"
+      continue
+    fi
+    IFS=$'\t' read -r _ kind root remote pglobs target <<< "$row"
+    case "$kind" in
+      nopush) why=$(nopush_inactive "$root" "$remote" "$pglobs" "$target")
+              echo "- $name $(age_days "$f")일째 — push 금지: ${root/#$HOME/\~} [$target]${why:+ (현재 비활성: $why — 설정을 되돌리면 다시 막으므로 보존)}: $(cat "$f")"
+              echo "    해제  autocommit unblock $root $target   (loop를 멈춘 뒤 실행)" ;;
+      fail)   echo "  참고 $name — hoc 실패 기록(cooldown 뒤 스스로 풀림): ${target/#$HOME/\~} (로그 $LOG)" ;;
+      nochg)
+        # 무효는 다음 tidy가 지운다. 작동 중이어도 며칠 안 된 것은 hoc의 평범한 거절일 수 있다
+        if ! git --no-optional-locks -C "$target" status --porcelain >/dev/null 2>&1 || [ "$(fingerprint "$target")" != "$(cat "$f")" ]; then state="  참고 $name(무효 — 다음 tidy가 정리)"
+        elif [ "$(age_days "$f")" -ge "$STALE_MARKER_DAYS" ]; then state="- $name"; else state="  참고 $name(아직 ${STALE_MARKER_DAYS}일 미만)"; fi
+        echo "$state $(age_days "$f")일째 — hoc이 커밋하지 않은 상태 그대로: ${target/#$HOME/\~}"
+        echo "    git status --porcelain (최대 20줄):"
+        git --no-optional-locks -C "$target" status --porcelain 2>&1 | head -20 | sed 's/^/      /'
+        echo "    .gitignore (최대 60줄):"
+        if [ -f "$target/.gitignore" ]; then head -60 "$target/.gitignore" | sed 's/^/      /'; else echo "      (없음)"; fi ;;
+    esac
+  done
+}
+review_prompt() {
+  printf '%s' "[autocommit review] autocommit(여러 로컬 저장소를 hoc -c로 자동 커밋·push하는 루프)의 점검 결과입니다. 아래 <stdin>에 audit 출력과 남은 상태 마커 전체가 있습니다. 읽기 전용으로만 조사하세요: 파일 수정·stage·commit·push·마커 삭제·unblock 실행을 하지 마세요. 자격증명·키 파일(.env, notify.env, credentials 등)은 열지 마세요. 필요하면 git status·git log·git diff --stat·.gitignore 읽기로 근거를 보강하세요. 항목마다 (1) 사람이 결정해야 함 (2) .gitignore에 넣을 줄 제안(어느 저장소·어떤 줄·근거 파일) (3) 붙여넣을 명령 제안 (4) 근거 부족으로 판단 불가 중 하나로 분류하고, 근거를 한 줄씩 쓰세요. 맨 위에 사람이 이번 주에 할 일을 3줄 이내로 요약하세요. 한국어로 쓰세요."
+}
+review() { # 매주 timer가 부른다. 정리는 잠금이 비었을 때만, 조사·메일은 잠금 없이
+  local base lk items rc subject
+  base="$STATE/review-$(date +%Y%m%d-%H%M%S)"
+  exec {lk}>"$STATE/lock"
+  if flock -n "$lk"; then tidy; else log "review: loop가 잠금을 쥐고 있어 정리는 건너뜀 — loop의 일일 점검이 정리한다"; fi
+  exec {lk}>&-
+  NOW=$(date +%s)
+  { audit; echo "[남은 마커 전체]"; marker_inventory; } > "$base.input" 2>&1
+  # 상기 문구는 매번 같은 고정 문구이고, 오래된 마커·push 금지 마커는 아래 전체 목록과 겹친다
+  items=$(awk '/^\[/{sec=$0} /^- / && sec!="[상기]" && sec!="[오래된 마커]" && !/hoc 검증 실패로 push 금지/{n++} END{print n+0}' "$base.input")
+  if [ "$items" -eq 0 ]; then log "review: 남은 항목 0건 — 에이전트·메일 생략 ($base.input)"; return 0; fi
+  rc=127
+  if command -v codex >/dev/null; then
+    head -c 60000 "$base.input" | timeout 1800 codex exec -C "$HOME" --skip-git-repo-check ${CHECKPOINT_MODEL:+-m "$CHECKPOINT_MODEL"} \
+      -c "model_reasoning_effort=$CHECKPOINT_EFFORT" -c approval_policy=never \
+      -s read-only --color never -o "$base.md" "$(review_prompt)" > "$base.log" 2>&1
+    rc=$?
+  fi
+  if [ "$rc" != 0 ] && { [ "$rc" = 127 ] || grep -q 'hit your usage limit' "$base.log" 2>/dev/null; } && command -v ccg-call >/dev/null; then
+    { review_prompt; printf '\n도구는 없습니다. 아래 출력만 근거로 판단하고, 근거가 부족한 부분은 부족하다고 쓰세요.\n'; head -c 60000 "$base.input"; } \
+      | timeout 1800 ccg-call --profile text > "$base.md" 2>> "$base.log"
+    rc=$?
+  fi
+  if [ "$rc" = 0 ] && [ -s "$base.md" ]; then
+    subject="[autocommit 점검] 남은 항목 ${items}건"
+  else
+    subject="[autocommit 점검] 에이전트 검토 실패(rc=$rc) — 남은 항목 ${items}건"
+    printf '에이전트 검토가 실패했습니다. 로그: %s\n아래 원본 점검 출력만 보냅니다.\n' "$base.log" > "$base.md"
+  fi
+  log "review: $subject — 보고서 $base.md"
+  [ -n "$REVIEW_MAIL_CMD" ] || { log "review: AC_REVIEW_MAIL_CMD 없음 — 메일 생략"; return 0; }
+  { cat "$base.md"; printf '\n\n---- 원본 점검 출력 (%s) ----\n' "$base.input"; cat "$base.input"; } \
+    | $REVIEW_MAIL_CMD "$subject" >> "$base.log" 2>&1 \
+    || { log "review: 메일 발송 실패 — $base.log"; return 1; }
+  log "review: 메일 발송 완료"
+}
+
+conf_roots_for() { # conf_roots_for <경로>: 같은 실제 경로를 가리키는 설정 행의 저장소 루트 문자열(마커 키에 쓰인 그대로). 중복 없이 한 줄씩
+  local want line path root nf seen=""
+  want=$(realpath -m -- "$(expand "$1")") || return 1
+  while IFS= read -r line; do
+    line=${line%%#*}; [ -n "${line//[[:space:]]/}" ] || continue
+    nf=$(wc -w <<< "$line"); { [ "$nf" -lt 3 ] || [ "$nf" -gt 4 ]; } && continue
+    read -r path _ <<< "$line"
+    root=$(expand "$path")
+    [ "$(realpath -m -- "$root")" = "$want" ] || continue
+    case "$seen" in *"|$root|"*) continue ;; esac
+    seen="$seen|$root|"; printf '%s\n' "$root"
+  done < "$CONF"
+}
+unblock() { # unblock <저장소> [<브랜치>]: 브랜치를 주면 그 브랜치의 push 금지 마커, 생략하면 저장소의 미해결 hoc 실행 기록만 지운다.
+  # 마커 키는 생성 때처럼 설정 행의 루트 문자열로 만든다. 해제는 보류 제거일 뿐 안전 검증이 아니다 — 다음 push도 모든 검사를 다시 거친다
+  local arg=$1 br=$2 roots root f files=() k v lk
+  # loop와 그 hoc 자식은 $STATE/lock을 쥐고 있다. 두 형태 모두 잠금을 잡은 뒤에 대상과 상태를 확인한다 — 확인과 삭제 사이에 새 기록이 끼어들지 않는다
+  exec {lk}>"$STATE/lock" || { echo "잠금 파일을 열 수 없다: $STATE/lock — 기록은 그대로 둔다" >&2; return 1; }
+  flock -n "$lk" || { echo "autocommit loop 또는 그 hoc가 잠금을 쥐고 있다 — loop를 멈추고 hoc가 끝난 뒤 다시 실행" >&2; return 1; }
+  roots=$(conf_roots_for "$arg")
+  [ -n "$roots" ] || { echo "설정(repos.conf)에서 이 저장소를 찾지 못함: $arg — 마커는 그대로 둔다 (autocommit audit 의 rm 안내 참고)" >&2; return 1; }
+  while IFS= read -r root; do
+    if [ -n "$br" ]; then f="$STATE/nopush-$(hash "$root:$br")"; else f=$(inflight_file "$root"); fi
+    [ -e "$f" ] && files+=("$root"$'\t'"$f")
+  done <<< "$roots"
+  if [ "${#files[@]}" -gt 1 ]; then
+    echo "같은 저장소를 가리키는 설정 행이 여러 개이고 기록도 여러 개다 — 어느 쪽인지 정할 수 없어 그대로 둔다:" >&2
+    printf '  %s\n' "${files[@]}" >&2; return 1
+  fi
+  [ "${#files[@]}" -eq 1 ] || { if [ -n "$br" ]; then echo "마커 없음"; else echo "미해결 hoc 실행 기록 없음"; fi; return 0; }
+  root=${files[0]%%$'\t'*}; f=${files[0]#*$'\t'}
+  if [ -n "$br" ]; then
+    [ ! -e "$(inflight_file "$root")" ] || { echo "hoc 실행 기록이 먼저 해결돼야 한다 — autocommit audit 확인 후 autocommit unblock $root" >&2; return 1; }
+    cat "$f"
+    rm -- "$f" || { echo "삭제 실패 — 마커는 그대로다: $f" >&2; return 1; }
+    echo "해제됨 — 보류만 풀었다. 다음 push 판정에서 위험 파일·원격·점유 검사를 다시 거친다"
+    return 0
+  fi
+  cat "$f"
+  while IFS='=' read -r k v; do
+    [ "$k" = worktree ] && [ -d "$v" ] || continue
+    echo "현재  $(git -C "$v" symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED) $(git -C "$v" rev-parse --short HEAD 2>/dev/null)"
+  done < "$f"
+  rm -- "$f" || { echo "삭제 실패 — 기록은 그대로다: $f" >&2; return 1; }
+  echo "해제됨 — 브랜치별 push 금지 마커는 그대로다. hoc가 만든 커밋은 다음 push 판정에서 다시 검사된다"
+}
+
+tick() {
+  NOW=$(date +%s); rotate_log
+  local line path cglobs remote pglobs extra root wts common seen="" nf
+  while IFS= read -r line; do
+    line=${line%%#*}; [ -n "${line//[[:space:]]/}" ] || continue
+    read -r path cglobs remote pglobs extra <<< "$line"
+    nf=$(wc -w <<< "$line")
+    if [ "$nf" -lt 3 ] || [ "$nf" -gt 4 ] || [ -z "$cglobs" ] || [ -z "$remote" ]; then note "malformed:$line" "설정 행 형식 오류(3~4열 필요) → 무시: $line"; continue; fi
+    root=$(expand "$path"); [ -d "$root" ] || { note "missing:$root" "저장소 경로 없음: $root"; continue; }
+    git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { note "notrepo:$root" "git 저장소 아님: $root"; continue; }
+    common=$(git -C "$root" rev-parse --git-common-dir 2>/dev/null); [ "${common#/}" = "$common" ] && common="$root/$common"; common=$(realpath "$common" 2>/dev/null)
+    case "$seen" in *"|$common|"*) once "dup:$root" "skip  $root (같은 저장소가 위 행에서 이미 처리됨 — 첫 행 정책 적용: $common)"; continue ;; esac
+    seen="$seen|$common|"
+    repo_due "$root" "$cglobs:$remote:${pglobs:-$cglobs}" || continue
+    wts=$(worktrees_of "$root")
+    [ "$MODE" = push-only ] || commit_stage "$root" "$cglobs" "$wts"
+    push_stage "$root" "$remote" "${pglobs:-$cglobs}" "$cglobs"
+    repo_schedule "$root" "$wts"
+  done < "$CONF"
+}
+
+need_committer() { # 기본 실행기(autocommit-agent)는 AC_AGENT가 없으면 매 커밋마다 실패하므로 시작 전에 막는다
+  [ -n "${AC_HOC:-}" ] || [ -n "${AC_AGENT:-}" ] && return 0
+  echo "autocommit: 커밋을 맡길 CLI를 AC_AGENT로 지정해야 한다 (claude|opencode|agy|codex) — README의 '커밋 위임 CLI 선택' 참고" >&2; exit 2
+}
+
+case "$MODE" in
+  up)
+    [ "${HERDR_ENV:-}" = 1 ] || { echo "autocommit up: herdr 안에서 실행해야 한다" >&2; exit 2; }
+    need_committer
+    herdr agent list 2>/dev/null | jq -e '.result.agents[] | select(.name=="autocommit")' >/dev/null && { echo "이미 autocommit 탭이 있다" >&2; exit 1; }
+    C=$(herdr tab create ${HERDR_WORKSPACE_ID:+--workspace "$HERDR_WORKSPACE_ID"} --cwd "$HOME" --label autocommit --no-focus) || exit 1
+    P=$(jq -r '.result.root_pane.pane_id' <<< "$C"); sleep 1
+    ENVS=; NAMES=   # 값은 셸 인용(%q)으로 그대로 넘기고, 화면·로그에는 이름만 남긴다
+    while IFS= read -r V; do case "$V" in AC_*) ENVS+="$V=$(printf %q "${!V}") "; NAMES+="$V " ;; esac; done < <(compgen -e)
+    herdr pane run "$P" "${ENVS}autocommit loop" >/dev/null && echo "autocommit 탭 시작: $(jq -r '.result.tab.tab_id' <<< "$C") pane=$P ${NAMES:+env: $NAMES}(로그: $LOG)" ;;
+  loop)
+    [ "${HERDR_ENV:-}" = 1 ] || { echo "autocommit loop: herdr pane 안에서 실행해야 한다" >&2; exit 2; }
+    need_committer
+    exec 9>"$STATE/lock"; flock -n 9 || { echo "다른 autocommit loop가 이미 돈다" >&2; exit 1; }
+    log "loop 시작 interval=${INTERVAL}s settle=${SETTLE}s first_settle=${FIRST_SETTLE}s push=$PUSH idle_max=${IDLE_MAX_INTERVAL}s checkpoint_after=${CHECKPOINT_AFTER}s scan_interval=${SCAN_INTERVAL}s conf=$CONF"
+    NORMAL_SETTLE=$SETTLE; START=$(date +%s)
+    while :; do
+      if [ $(( $(date +%s) - START )) -lt "$FIRST_SETTLE" ]; then SETTLE=$FIRST_SETTLE; else SETTLE=$NORMAL_SETTLE; fi
+      tick; scan_tick; audit_tick; sleep "$INTERVAL"
+    done ;;
+  once|push-only)
+    [ "$MODE" = push-only ] || [ "${HERDR_ENV:-}" = 1 ] || { echo "autocommit once: herdr pane 안에서 실행 (plan은 밖에서도 됨)" >&2; exit 2; }
+    [ "$MODE" = push-only ] || need_committer
+    exec 9>"$STATE/lock"; flock -n 9 || { echo "autocommit loop가 도는 중" >&2; exit 1; }
+    SETTLE=$FIRST_SETTLE; tick ;;
+  plan) tick ;;
+  scan) scan ;;
+  audit) audit ;;
+  tidy)
+    exec 9>"$STATE/lock"; flock -n 9 || { echo "autocommit loop가 도는 중 — 정리는 loop의 일일 점검이 맡는다" >&2; exit 1; }
+    tidy ;;
+  review) review ;;
+  unblock)
+    [ $# -eq 2 ] || [ $# -eq 3 ] || { echo "autocommit unblock <저장소> [<브랜치>]" >&2; exit 2; }
+    unblock "$2" "${3:-}" ;;
+  *) sed -n '2,25p' "$0" | sed 's/^# \?//'; exit 2 ;;
+esac; exit $?   # 같은 줄의 exit까지 미리 읽힌다 — 실행 중 이 파일이 바뀌어도 이어서 읽지 않는다

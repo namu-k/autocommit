@@ -1,0 +1,10 @@
+[Unit]
+Description=autocommit weekly review of markers that do not clear themselves
+
+[Service]
+Type=oneshot
+# systemd 기본 PATH에는 사용자 설치 CLI가 없다. codex 등이 다른 곳에 있으면 `systemctl --user edit autocommit-review.service`로
+# Environment=PATH=... 를 덮어쓴다. 메일 보고는 같은 방법으로 Environment=AC_REVIEW_MAIL_CMD=<명령> 을 추가한다.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/autocommit review
+TimeoutStartSec=45min
