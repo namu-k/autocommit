@@ -1033,6 +1033,9 @@ class AutocommitTests(unittest.TestCase):
                 result = subprocess.run([str(SOURCE), mode], env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("AC_AGENT", result.stderr)
+        result = subprocess.run([str(SOURCE), "once"], env=dict(env, AC_AGENT="codex"), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("AC_AGENT_UNRESTRICTED=1", result.stderr)
 
     def test_default_committer_resolves_through_install_symlink(self):
         link_dir = self.base / "local-bin"

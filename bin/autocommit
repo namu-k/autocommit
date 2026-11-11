@@ -1016,7 +1016,10 @@ tick() {
 }
 
 need_committer() { # 기본 실행기(autocommit-agent)는 AC_AGENT가 없으면 매 커밋마다 실패하므로 시작 전에 막는다
-  [ -n "${AC_HOC:-}" ] || [ -n "${AC_AGENT:-}" ] && return 0
+  [ -n "${AC_HOC:-}" ] && return 0
+  [ "${AC_AGENT:-}" = codex ] && [ "${AC_AGENT_UNRESTRICTED:-0}" != 1 ] && {
+    echo "autocommit: AC_AGENT=codex는 권한 제한 없이 실행된다(push도 막지 못함). 감수하려면 AC_AGENT_UNRESTRICTED=1" >&2; exit 2; }
+  [ -n "${AC_AGENT:-}" ] && return 0
   echo "autocommit: 커밋을 맡길 CLI를 AC_AGENT로 지정해야 한다 (claude|opencode|agy|codex) — README의 '커밋 위임 CLI 선택' 참고" >&2; exit 2
 }
 
